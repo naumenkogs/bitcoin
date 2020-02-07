@@ -1102,6 +1102,7 @@ static bool MaybePunishNodeForTx(NodeId nodeid, const TxValidationState& state, 
     case TxValidationResult::TX_MISSING_INPUTS:
     case TxValidationResult::TX_PREMATURE_SPEND:
     case TxValidationResult::TX_WITNESS_MUTATED:
+    case TxValidationResult::TX_WITNESS_STRIPPED:
     case TxValidationResult::TX_CONFLICT:
     case TxValidationResult::TX_MEMPOOL_POLICY:
         break;
@@ -1942,10 +1943,16 @@ void static ProcessOrphanTx(CConnman* connman, std::set<uint256>& orphan_work_se
             // Has inputs but not accepted to mempool
             // Probably non-standard or insufficient fee
             LogPrint(BCLog::MEMPOOL, "   removed orphan tx %s\n", orphanHash.ToString());
-            if (orphanTx.HasWitness() || orphan_state.GetResult() != TxValidationResult::TX_WITNESS_MUTATED) {
-                // Do not use rejection cache for witness transactions or
-                // witness-stripped transactions, as they can have been malleated.
-                // See https://github.com/bitcoin/bitcoin/issues/8279 for details.
+            if (orphan_state.GetResult() != TxValidationResult::TX_WITNESS_STRIPPED) {
+                // Do not add txids of witness transactions or witness-stripped
+                // transactions to the filter, as they can have been malleated;
+                // adding such txids to the reject filter would potentially
+                // interfere with relay of valid transactions from peers that
+                // do not support wtxid-based relay. See
+                // https://github.com/bitcoin/bitcoin/issues/8279 for details.
+                // We can remove this restriction (and always add wtxids to
+                // the filter even for witness stripped transactions) once
+                // wtxid-based relay is broadly deployed.
                 assert(recentRejects);
                 recentRejects->insert(orphanTx.GetWitnessHash());
             }
@@ -2672,10 +2679,16 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                 recentRejects->insert(tx.GetWitnessHash());
             }
         } else {
-            if (tx.HasWitness() || state.GetResult() != TxValidationResult::TX_WITNESS_MUTATED) {
-                // Do not use rejection cache for witness transactions or
-                // witness-stripped transactions, as they can have been malleated.
-                // See https://github.com/bitcoin/bitcoin/issues/8279 for details.
+            if (state.GetResult() != TxValidationResult::TX_WITNESS_STRIPPED) {
+                // Do not add txids of witness transactions or witness-stripped
+                // transactions to the filter, as they can have been malleated;
+                // adding such txids to the reject filter would potentially
+                // interfere with relay of valid transactions from peers that
+                // do not support wtxid-based relay. See
+                // https://github.com/bitcoin/bitcoin/issues/8279 for details.
+                // We can remove this restriction (and always add wtxids to
+                // the filter even for witness stripped transactions) once
+                // wtxid-based relay is broadly deployed.
                 assert(recentRejects);
                 recentRejects->insert(tx.GetWitnessHash());
                 if (RecursiveDynamicUsage(*ptx) < 100000) {
