@@ -2354,7 +2354,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             }
             else
             {
-                pfrom->AddInventoryKnown(inv.hash);
+                pfrom->AddKnownTx(inv.hash);
                 if (fBlocksOnly) {
                     LogPrint(BCLog::NET, "transaction (%s) inv sent in violation of protocol, disconnecting peer=%d\n", inv.hash.ToString(), pfrom->GetId());
                     pfrom->fDisconnect = true;
@@ -2595,7 +2595,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         CNodeState* nodestate = State(pfrom->GetId());
 
         const uint256& hash = nodestate->m_wtxid_relay ? wtxid : txid;
-        pfrom->AddInventoryKnown(hash);
+        pfrom->AddKnownTx(hash);
 
         TxValidationState state;
 
@@ -2660,7 +2660,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                     // Eventually we should replace this with an improved
                     // protocol for getting all unconfirmed parents.
                     CInv _inv(MSG_TX | nFetchFlags, txin.prevout.hash);
-                    pfrom->AddInventoryKnown(txin.prevout.hash);
+                    pfrom->AddKnownTx(txin.prevout.hash);
                     if (!AlreadyHave(_inv)) RequestTx(State(pfrom->GetId()), _inv.hash, current_time);
                 }
                 AddOrphanTx(ptx, pfrom->GetId());
