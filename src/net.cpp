@@ -1061,6 +1061,9 @@ void CConnman::DisconnectNodes()
                 // close socket and cleanup
                 pnode->CloseSocketDisconnect();
 
+                // remove from reconciliation queue
+                std::remove(m_recon_queue.begin(), m_recon_queue.end(), pnode);
+
                 // hold in disconnected pool until all refs are released
                 pnode->Release();
                 vNodesDisconnected.push_back(pnode);
@@ -1701,6 +1704,21 @@ int CConnman::GetExtraOutboundCount()
     return std::max(nOutbound - m_max_outbound_full_relay - m_max_outbound_block_relay, 0);
 }
 
+uint64_t CConnman::GetOutboundCountByTxRelayType(bool flooding)
+{
+    uint64_t result = 0;
+    {
+        LOCK(cs_vNodes);
+        for (const CNode* pnode : vNodes) {
+            if (!pnode->fInbound && pnode->m_flood_to) {
+                if (flooding && pnode->m_flood_to) ++result;
+                if (!flooding && pnode->m_recon_state) ++result;
+            }
+        }
+    }
+    return result;
+}
+
 void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
 {
     // Connect to specific addresses
@@ -2194,6 +2212,7 @@ CConnman::CConnman(uint64_t nSeed0In, uint64_t nSeed1In) : nSeed0(nSeed0In), nSe
 
     Options connOptions;
     Init(connOptions);
+    m_local_recon_salt = GetRand(UINT64_MAX);
 }
 
 NodeId CConnman::GetNewNodeId()
@@ -2682,6 +2701,8 @@ CNode::CNode(NodeId idIn, ServiceFlags nLocalServicesIn, int nMyStartingHeightIn
     // peers (to prevent adversaries from inferring these links from addr
     // traffic).
     m_addr_known{block_relay_only ? nullptr : MakeUnique<CRollingBloomFilter>(5000, 0.001)},
+    // By default, flood to all peers which are willing to accept transactions
+    m_flood_to{!block_relay_only},
     id(idIn),
     nLocalHostNonce(nLocalHostNonceIn),
     nLocalServices(nLocalServicesIn),

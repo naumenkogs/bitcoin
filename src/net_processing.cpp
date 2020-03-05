@@ -84,6 +84,8 @@ static_assert(INBOUND_PEER_TX_DELAY >= MAX_GETDATA_RANDOM_DELAY,
 /** Limit to avoid sending big packets. Not used in processing incoming GETDATA for compatibility */
 static const unsigned int MAX_GETDATA_SZ = 1000;
 
+// Component of the full salt used to compute short txids for reconciliation.
+static const std::string RECON_STATIC_SALT = "Tx Relay Salting";
 
 struct COrphanTx {
     // When modifying, adapt the copy of this definition in tests/DoS_tests.
@@ -2060,6 +2062,18 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
 
         if (nVersion >= WTXID_RELAY_VERSION) {
             connman->PushMessage(pfrom, CNetMsgMaker(INIT_PROTO_VERSION).Make(NetMsgType::WTXIDRELAY));
+            // Reconciliation is supported only when wtxid relay is supported.
+            bool recon_sender, recon_responder;
+            // Currently reconciliation requests flow only in one direction inbound->outbound.
+            if (pfrom->fInbound) {
+                recon_sender = true;
+                recon_responder = false;
+            } else {
+                recon_sender = false;
+                recon_responder = true;
+            }
+            uint32_t recon_version = 1;
+            connman->PushMessage(pfrom, CNetMsgMaker(INIT_PROTO_VERSION).Make(NetMsgType::SENDRECON, recon_sender, recon_responder, recon_version, connman->m_local_recon_salt));
         }
 
         connman->PushMessage(pfrom, CNetMsgMaker(INIT_PROTO_VERSION).Make(NetMsgType::VERACK));
@@ -3343,6 +3357,62 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         return true;
     }
 
+    // Received from an inbound peer planning to reconcilie transactions with us, or
+    // from an outgoing peer demonstrating readiness to do reconciliations.
+    // If received from outgoing, adds the peer to the reconciliation queue.
+    if (strCommand == NetMsgType::SENDRECON) {
+        if (!pfrom->m_tx_relay) return true;
+        if(pfrom->m_recon_state != nullptr) return true; // Do not support reconciliation salt/version updates.
+
+        bool recon_sender, recon_responder;
+        uint64_t remote_salt;
+        uint32_t recon_version;
+        vRecv >> recon_sender >> recon_responder >> recon_version >> remote_salt;
+        if (recon_version != 1) return true;
+
+        // According to current erlay spec.
+        if (recon_sender == recon_responder) return true;
+
+        if (pfrom->fInbound) {
+            if (!recon_sender) return true;
+            // Do not flood through inbound connections which support reconciliation to save bandwidth.
+            pfrom->m_flood_to = false;
+        } else {
+            if (!recon_responder) return true;
+            uint64_t outbound_flooding = connman->GetOutboundCountByTxRelayType(true);
+            if (outbound_flooding > MAX_OUTBOUND_FLOOD_TO)
+                pfrom->m_flood_to = false;
+        }
+
+        pfrom->m_recon_state = MakeUnique<CNode::ReconState>();
+        pfrom->m_recon_state->sender = recon_sender;
+        pfrom->m_recon_state->responder = recon_responder;
+        pfrom->m_recon_state->local_q = DEFAULT_RECON_Q;
+
+        uint64_t local_salt = connman->m_local_recon_salt;
+
+        std::string salt1, salt2;
+        if (remote_salt < local_salt) {
+            salt1 = std::to_string(remote_salt);
+            salt2 = std::to_string(local_salt);
+        } else {
+            salt1 = std::to_string(local_salt);
+            salt2 = std::to_string(remote_salt);
+        }
+        uint256 full_salt;
+        CSHA256().Write((unsigned char*)RECON_STATIC_SALT.data(), RECON_STATIC_SALT.size()).
+            Write((unsigned char*)salt1.data(), salt1.size()).
+            Write((unsigned char*)salt2.data(), salt2.size()).
+            Finalize(full_salt.begin());
+        pfrom->m_recon_state->salt = full_salt;
+
+        // Reconcile with all outbound peers supporting reconciliation (even if we flood to them),
+        // to not miss transactions they have for us but won't flood (due to the low-fanout).
+        if (pfrom->m_recon_state->responder && !pfrom->fInbound) {
+            connman->m_recon_queue.push_back(pfrom);
+        }
+        return true;
+    }
     // Ignore unknown commands for extensibility
     LogPrint(BCLog::NET, "Unknown command \"%s\" from peer=%d\n", SanitizeString(strCommand), pfrom->GetId());
     return true;

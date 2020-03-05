@@ -30,6 +30,7 @@
 #include <thread>
 #include <memory>
 #include <condition_variable>
+#include "minisketch/include/minisketch.h"
 
 #ifndef WIN32
 #include <arpa/inet.h>
@@ -90,6 +91,11 @@ static const bool DEFAULT_FORCEDNSSEED = false;
 static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
+// Limit flooding through outbound peers. For the rest of outbound peers
+// and all inbound peers, use reconciliation if supported by peer. Otherwise, flood.
+static constexpr uint32_t MAX_OUTBOUND_FLOOD_TO = 8;
+// Default coefficient used to estimate set difference for tx reconciliation;
+static constexpr double DEFAULT_RECON_Q = 0.01;
 typedef int64_t NodeId;
 
 struct AddedNodeInfo
@@ -272,6 +278,13 @@ public:
     // not yet fully disconnected.
     int GetExtraOutboundCount();
 
+    // Return the number of outbound peers we relay transactions to
+    // in a specified way (flooding or reconciliation)
+    // Used to determine whether we should flood to a new peer
+    // which supports reconciliation, in case we haven't reached
+    // the outbound flooding bandwidth-conserving limit.
+    uint64_t GetOutboundCountByTxRelayType(bool flooding);
+
     bool AddNode(const std::string& node);
     bool RemoveAddedNode(const std::string& node);
     std::vector<AddedNodeInfo> GetAddedNodeInfo();
@@ -332,7 +345,12 @@ public:
     int64_t PoissonNextSendInbound(int64_t now, int average_interval_seconds);
 
     void SetAsmap(std::vector<bool> asmap) { addrman.m_asmap = asmap; }
+    // Tracks with which peer we should reconcile next.
+    std::deque<CNode*> m_recon_queue;
 
+    // Salt used to compute short IDs during reconciliation.
+    // Shared across all peers.
+    uint64_t m_local_recon_salt{0};
 private:
     struct ListenSocket {
     public:
@@ -844,6 +862,64 @@ public:
     std::atomic<bool> fPingQueued{false};
 
     std::set<uint256> orphan_work_set;
+
+    
+    enum ReconPhase {
+        NONE,
+        INIT_REQUESTED,
+        INIT_RESPONDED,
+        BISEC_REQUESTED,
+        BISEC_RESPONDED,
+    };
+
+    struct ReconState {
+        ReconState() {};
+        // Whether this peer will send reconciliation requests.
+        bool sender;
+
+        // Whether this peer will respond to reconciliation requests.
+        bool responder;
+
+        // Generated from peer's and local salts, used to compute short txids for reconciliation
+        uint256 salt;
+
+        // wtxids to be used in the initial step of reconciliation.
+        std::set<uint256> local_set;
+
+        // wtxids saved from the initial step of ongoing reconciliation and to be used in bisection.
+        std::set<uint256> local_set_snapshot;
+
+        // Store capacity of the sent sketch during the init round to use while bisecting.
+        uint32_t capacity_snapshot{0};
+
+        // Maps short salted IDs previously used in reconciliation to full wtxidss.
+        std::map<uint32_t, uint256> local_short_id_mapping;
+
+        // Obtained at the reconciliation request and used for difference estimation.
+        uint16_t remote_set_size;
+
+        // Coefficient to help the peer to estimate the set difference.
+        double local_q;
+
+        // Coefficient the peer requests us to use when computing a sketch for them.
+        double remote_q;
+
+        // If we asked for bisection, store the original sketches to use if bisection succeeds
+        minisketch* remote_sketch_snapshot;
+        minisketch* local_sketch_snapshot;
+
+        // Tracks when we should respond to the reconciliation request of the peer.
+        std::chrono::microseconds next_recon_respond{0};
+
+        ReconPhase incoming_recon{ReconPhase::NONE};
+        ReconPhase outgoing_recon{ReconPhase::NONE};
+    };
+
+    // nullptr if we're not reconciling (neither passively nor actively) with this peer
+    std::unique_ptr<ReconState> m_recon_state;
+    // Whether we should flood transactions to the peer (as opposed to reconciliation).
+    bool m_flood_to{false};
+
 
     CNode(NodeId id, ServiceFlags nLocalServicesIn, int nMyStartingHeightIn, SOCKET hSocketIn, const CAddress &addrIn, uint64_t nKeyedNetGroupIn, uint64_t nLocalHostNonceIn, const CAddress &addrBindIn, const std::string &addrNameIn = "", bool fInboundIn = false, bool block_relay_only = false);
     ~CNode();
