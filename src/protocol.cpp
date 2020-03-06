@@ -42,6 +42,11 @@ const char *GETBLOCKTXN="getblocktxn";
 const char *BLOCKTXN="blocktxn";
 const char *WTXIDRELAY="wtxidrelay";
 const char *SENDRECON="sendrecon";
+const char *REQRECON="reqrecon";
+const char *SKETCH="sketch";
+const char *REQBISEC="reqbisec";
+const char *RECONCILDIFF="reconcildiff";
+
 } // namespace NetMsgType
 
 /** All known message types. Keep this in the same order as the list of
@@ -75,6 +80,10 @@ const static std::string allNetMessageTypes[] = {
     NetMsgType::BLOCKTXN,
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDRECON,
+    NetMsgType::REQRECON,
+    NetMsgType::SKETCH,
+    NetMsgType::REQBISEC,
+    NetMsgType::RECONCILDIFF,
 };
 const static std::vector<std::string> allNetMessageTypesVec(allNetMessageTypes, allNetMessageTypes+ARRAYLEN(allNetMessageTypes));
 

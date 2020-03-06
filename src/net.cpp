@@ -628,6 +628,128 @@ int CNode::GetSendVersion() const
     return nSendVersion;
 }
 
+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing) {
+    // According to the erlay spec, reconciliation is initiated by inbound peers.
+    if (m_recon_state->sender) {
+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);
+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;
+    } else {
+        // When reconciliation initialized by us is done, update local q for future reconciliations.
+        if (action == LocalQAction::Q_RECOMPUTE) {
+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);
+            uint8_t local_set_size;
+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {
+                local_set_size = m_recon_state->local_set_snapshot.size();
+            } else {
+                local_set_size = m_recon_state->local_set.size();
+            }
+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;
+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);
+            uint8_t min_size = std::min(local_set_size, remote_set_size);
+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;
+            if (min_size != 0)
+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;
+        } else if (action == LocalQAction::Q_INCREASE) {
+                m_recon_state->local_q *= 1.1;
+        } else if (action == LocalQAction::Q_SET_DEFAULT) {
+            m_recon_state->local_q = DEFAULT_RECON_Q;
+        }
+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;
+    }
+    if (clear_local_set) m_recon_state->local_set.clear();
+
+    m_recon_state->local_short_id_mapping.clear();
+    // This is currently belt-and-suspenders, as the code should work even without these calls.
+    m_recon_state->local_set_snapshot.clear();
+    m_recon_state->capacity_snapshot = 0;
+    m_recon_state->remote_sketch_snapshot = nullptr;
+    m_recon_state->local_sketch_snapshot = nullptr;
+}
+
+uint32_t CNode::ComputeShortID(uint256 wtxid) {
+    uint64_t k0 = m_recon_state->salt.GetUint64(0);
+    uint64_t k1 = m_recon_state->salt.GetUint64(1);
+    uint64_t s = SipHashUint256(k0, k1, wtxid);
+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);
+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));
+    return short_txid;
+}
+
+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity) {
+    std::vector<uint32_t> short_ids;
+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {
+        // During bisection, all the relevant transactions are stored in the snapshot.
+        // Original set is used to not miss transactions received during the reconciliation elsewhere.
+        if (m_recon_state->local_set_snapshot.size() == 0) {
+            return nullptr;
+        }
+        for (uint256 wtxid: m_recon_state->local_set_snapshot) {            
+            short_ids.push_back(ComputeShortID(wtxid));
+        }
+
+        std::vector<uint32_t> bisec_short_ids;
+        for (uint32_t short_id: short_ids) {
+            if (bisection_chunk == BISECTION_LOW) {
+                if (short_id <= BISECTION_MEDIAN) {
+                    bisec_short_ids.push_back(short_id);
+                }
+            } else {
+                if (short_id > BISECTION_MEDIAN) {
+                    bisec_short_ids.push_back(short_id);
+                }
+            }
+        }
+        short_ids = bisec_short_ids;
+        // For bisection, use capacity used in the initial reconciliation.
+        capacity = m_recon_state->capacity_snapshot;
+    } else {
+        for (uint256 wtxid: m_recon_state->local_set) {            
+            short_ids.push_back(ComputeShortID(wtxid));
+        }
+
+        if (capacity == 0) {
+            // Estimate locally, as requested by the calling function.
+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;
+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;
+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +
+                abs(set_size_diff);
+        }
+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);
+        // If bisection is required, we will use this capacity from the initial reconciliation.
+        m_recon_state->capacity_snapshot = capacity;
+    }
+    if (short_ids.size() == 0) return nullptr;
+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);
+    for (uint32_t short_id: short_ids) {
+        minisketch_add_uint64(sketch, short_id);
+    }
+    return sketch;
+}
+
+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t> &local_missing, CConnman *connman) {
+    std::vector<uint256> remote_missing;
+    for (int i = 0; i < diff_size; ++i) {
+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);
+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {
+            remote_missing.push_back(local_tx->second);
+        } else {
+            local_missing.push_back(diff[i]);
+        }
+    }
+    return remote_missing;
+}
+
+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman *connman) {
+    std::vector<uint256> remote_missing;
+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {
+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);
+        assert(local_tx != m_recon_state->local_short_id_mapping.end());
+        remote_missing.push_back(local_tx->second);
+    }
+    return remote_missing;
+}
+
+
 int V1TransportDeserializer::readHeader(const char *pch, unsigned int nBytes)
 {
     // copy data to temporary parsing buffer
@@ -2798,6 +2920,22 @@ int64_t CConnman::PoissonNextSendInbound(int64_t now, int average_interval_secon
     }
     return m_next_send_inv_to_incoming;
 }
+
+void CConnman::UpdateNextReconRequest(std::chrono::microseconds now)
+{
+    m_next_recon_request = now + RECON_REQUEST_INTERVAL / m_recon_queue.size();
+}
+
+
+
+std::chrono::microseconds CConnman::NextReconRespond(std::chrono::microseconds now)
+{
+    if (m_next_recon_respond < now) {
+        m_next_recon_respond = now + RECON_RESPONSE_INTERVAL;
+    }
+    return m_next_recon_respond;
+}
+
 
 int64_t PoissonNextSend(int64_t now, int average_interval_seconds)
 {

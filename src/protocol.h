@@ -244,6 +244,32 @@ extern const char *WTXIDRELAY;
  * @since protocol version 80001 as described by BIP 330
  */
 extern const char *SENDRECON;
+/**
+ * Requests a reconciliation, and provides local reconciliation set size
+ * and coefficient used to accurately estimate reconciliation set difference 
+ * for a peer to construct a set sketch.
+ * Peer should respond with "sketch" message.
+ * @since protocol version 80001 as described by BIP 330
+ */
+extern const char *REQRECON;
+/**
+ * Contains a sketch of the local reconciliation set,
+ * used to efficiently reconcile transactions.
+ * Peer should respond with "reconcildiff" or "reqbisec" message.
+ * @since protocol version 80001 as described by BIP 330
+ */
+extern const char *SKETCH;
+/**
+ * Requests a bisection for ongoing reconciliation.
+ * @since protocol version 80001 as described by BIP 330
+ */
+extern const char *REQBISEC;
+/**
+ * Indicates whether ongoing reconciliation has succeeded,
+ * and requests the missing transactions by short ids.
+ * @since protocol version 80001 as described by BIP 330
+ */
+extern const char *RECONCILDIFF;
 };
 
 /* Get a vector of all valid message types (see above) */

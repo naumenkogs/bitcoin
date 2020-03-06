@@ -28,6 +28,8 @@
 #include <util/strencodings.h>
 #include <util/validation.h>
 
+#include "minisketch/include/minisketch.h"
+
 #include <memory>
 #include <typeinfo>
 
@@ -83,11 +85,21 @@ static_assert(INBOUND_PEER_TX_DELAY >= MAX_GETDATA_RANDOM_DELAY,
 "To preserve security, MAX_GETDATA_RANDOM_DELAY should not exceed INBOUND_PEER_DELAY");
 /** Limit to avoid sending big packets. Not used in processing incoming GETDATA for compatibility */
 static const unsigned int MAX_GETDATA_SZ = 1000;
-
+// Used to convert reconciliation q to an int.
+static constexpr double Q_PRECISION{2 << 12};
+// Reconciliation cannot result in finding larger transaction set difference.
+static constexpr uint8_t RECONCIL_MAX_DIFF = 2 << 6;
 // Component of the full salt used to compute short txids for reconciliation.
 static const std::string RECON_STATIC_SALT = "Tx Relay Salting";
 // Maximum number of elements to store in the reconciliation set.
 static const unsigned int MAX_RECON_SET = 1000;
+
+enum ReconResult {
+    RECON_FAILED,
+    RECON_LOW_FAILED,
+    RECON_HIGH_FAILED,
+    RECON_SUCCESS
+};
 
 struct COrphanTx {
     // When modifying, adapt the copy of this definition in tests/DoS_tests.
@@ -1973,6 +1985,23 @@ void static ProcessOrphanTx(CConnman* connman, std::set<uint256>& orphan_work_se
     }
 }
 
+// Done after reconciliation. No need to add transactions to peer's filter, or do checks
+// because it was already done when adding to the reconciliation set.
+void static AnnounceTxs(std::vector<uint256> remote_missing_wtxids, CNode* pto, CNetMsgMaker msgMaker, CConnman* connman) {
+    if (remote_missing_wtxids.size() != 0) {
+        std::vector<CInv> remote_missing_invs;
+        for (uint256 wtxid: remote_missing_wtxids) {
+            CInv winv(MSG_WTX, wtxid);
+            remote_missing_invs.push_back(winv);
+            if (remote_missing_invs.size() == MAX_INV_SZ) {
+                connman->PushMessage(pto, msgMaker.Make(NetMsgType::INV, remote_missing_invs));                
+                remote_missing_invs.clear();
+            }
+        }
+        connman->PushMessage(pto, msgMaker.Make(NetMsgType::INV, remote_missing_invs));
+    }
+}
+
 bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStream& vRecv, int64_t nTimeReceived, const CChainParams& chainparams, CConnman* connman, BanMan* banman, const std::atomic<bool>& interruptMsgProc)
 {
     LogPrint(BCLog::NET, "received: %s (%u bytes) peer=%d\n", SanitizeString(strCommand), vRecv.size(), pfrom->GetId());
@@ -3428,6 +3457,275 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         }
         return true;
     }
+
+    std::chrono::microseconds current_time = GetTime<std::chrono::microseconds>(); 
+
+    // Record an (expected) reconciliation request with parameters to respond when time comes.
+    // All initial reconciliation responses will be done at the same time to prevent tx-related privacy leaks.
+    if (strCommand == NetMsgType::REQRECON) {
+        if (!pfrom->m_recon_state->sender) return true;
+        if (pfrom->m_recon_state->incoming_recon != CNode::ReconPhase::NONE) return true;
+        uint32_t peer_recon_set_size, peer_q;
+        vRecv >> peer_recon_set_size >> peer_q;
+        pfrom->m_recon_state->incoming_recon = CNode::ReconPhase::INIT_REQUESTED;
+        pfrom->m_recon_state->remote_set_size = peer_recon_set_size;
+        pfrom->m_recon_state->remote_q = double(peer_q / Q_PRECISION);
+        pfrom->m_recon_state->next_recon_respond = connman->NextReconRespond(current_time);
+        return true;
+    }
+
+    // Received a response to the reconciliation request (initial request or request for bisection if initial failed).
+    // May leak tx-related privacy if we announce local transactions right away, if a peer is strategic about sending
+    // sketches to us via different connections (requires attacker to occupy multiple outgoing connections).
+    if (strCommand == NetMsgType::SKETCH) {
+        if (pfrom->m_recon_state->outgoing_recon != CNode::ReconPhase::INIT_REQUESTED &&
+            pfrom->m_recon_state->outgoing_recon != CNode::ReconPhase::BISEC_REQUESTED) return true;
+
+        std::vector<uint8_t> skdata;
+        vRecv >> skdata;
+
+        // If an empty sketch was sent (initially or as a bisection), reconciliation will fail.
+        if (skdata.size() == 0) {
+            std::vector<uint256> local_recon_set;
+            bool clear_local_set;
+            if (pfrom->m_recon_state->outgoing_recon == CNode::ReconPhase::INIT_REQUESTED) {
+                // If an empty sketch was send to an initial repsonse, the peer does not have any new transactions.
+                LogPrint(BCLog::NET, "Outgoing reconciliation terminated after peer=%i sent empty sketch\n", pfrom->GetId());
+                local_recon_set.assign(pfrom->m_recon_state->local_set.begin(), pfrom->m_recon_state->local_set.end());
+                clear_local_set = true; // safe to do so because we will send all the transactions right here.
+            } else {
+                // Peer's low chunk has no transaction, in this case bisection does not help
+                LogPrint(BCLog::NET, "Outgoing reconciliation failed after peer=%i sent empty bisection sketch\n", pfrom->GetId());
+                local_recon_set.assign(pfrom->m_recon_state->local_set_snapshot.begin(), pfrom->m_recon_state->local_set_snapshot.end());
+                clear_local_set = false; // keep it because it might continue new transactions received during reconciliation.
+            }
+            // In both cases, just send all transactions to the peer and notify about reconciliation failure,
+            // to receive transactions from their reconciliation set.
+            AnnounceTxs(local_recon_set, pfrom, msgMaker, connman);
+            connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_FAILED), std::vector<uint32_t>()));
+            pfrom->FinalizeReconciliation(clear_local_set, CNode::LocalQAction::Q_SET_DEFAULT);
+            return true;
+        }
+
+        // Attempt to decode the received sketch with a local sketch.
+        // Handles both initial reconciliation and bisection cases.
+        if (skdata.size() / BYTES_PER_SKETCH_ELEMENT > MAX_SKETCH_CAPACITY) return true;
+        uint16_t remote_sketch_capacity = uint16_t(skdata.size() / BYTES_PER_SKETCH_ELEMENT);
+        minisketch* remote_sketch = minisketch_create(RECON_FIELD_SIZE, 0, remote_sketch_capacity);
+        uint8_t remote_sketch_serialized[MAX_SKETCH_CAPACITY * BYTES_PER_SKETCH_ELEMENT];
+        std::copy(skdata.begin(), skdata.end(), remote_sketch_serialized);
+        minisketch_deserialize(remote_sketch, remote_sketch_serialized);
+
+        minisketch* working_sketch; // Contains sketch of the set difference (full or low chunk)
+        minisketch* local_sketch; // Stores local sketch (full or low chunk)
+        if (pfrom->m_recon_state->outgoing_recon == CNode::ReconPhase::INIT_REQUESTED) {
+            local_sketch = pfrom->ComputeSketch(true, CNode::BisectionChunk::BISECTION_NONE, remote_sketch_capacity);
+        } else {
+            local_sketch = pfrom->ComputeSketch(true, CNode::BisectionChunk::BISECTION_LOW, remote_sketch_capacity);
+        }
+        if (local_sketch != nullptr) {
+            working_sketch = minisketch_clone(local_sketch);
+            minisketch_merge(working_sketch, remote_sketch); 
+        } else {
+            working_sketch = minisketch_clone(remote_sketch);
+        }
+
+        // Attempt to decode the set difference (full or low chunk).
+        uint64_t differences[RECONCIL_MAX_DIFF];
+        ssize_t num_differences = minisketch_decode(working_sketch, RECONCIL_MAX_DIFF, differences);
+        bool decoded = num_differences >= 0;
+
+        std::vector<uint32_t> local_missing;
+        if (decoded) {
+            // Reconciliation over the current working chunk succeeded
+            if (pfrom->m_recon_state->outgoing_recon == CNode::ReconPhase::INIT_REQUESTED) {
+                // Initial reconciliation succeeded
+                // Send/request transactions which found to be missing
+                LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i succeded without bisection\n", pfrom->GetId());
+                std::vector<uint256> remote_missing = pfrom->GetRelevantIDsFromShortIDs(differences, num_differences, local_missing, connman);
+                AnnounceTxs(remote_missing, pfrom, msgMaker, connman);
+                connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_SUCCESS), local_missing));
+                pfrom->FinalizeReconciliation(true, CNode::LocalQAction::Q_RECOMPUTE, local_missing.size(), remote_missing.size());
+            } else {
+                // Reconciliation over the low chunk succeeded.
+                // Attempt to reconcile over the high chunks.
+
+                LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i succeded after bisection (low chunk)\n", pfrom->GetId());
+                // Compute missing transactions in the low chunk.
+                std::vector<uint256> remote_missing = pfrom->GetRelevantIDsFromShortIDs(differences, num_differences, local_missing, connman);
+    
+                // Attempt to find the difference over the high chunk, which can be derived from the low.
+                assert(pfrom->m_recon_state->remote_sketch_snapshot != nullptr); // Otherwise reconciliation should have been cancelled.
+                minisketch* working_sketch_high = minisketch_clone(pfrom->m_recon_state->remote_sketch_snapshot);
+                minisketch_merge(working_sketch_high, remote_sketch); // Working sketch now stores high chunk of the remote set.
+
+                if (pfrom->m_recon_state->local_sketch_snapshot != nullptr) {
+                    // Computes sketch of the local high chunk.
+                    minisketch* local_sketch_high = minisketch_clone(pfrom->m_recon_state->local_sketch_snapshot);
+                    if (local_sketch != nullptr) {
+                        minisketch_merge(local_sketch_high, local_sketch);
+                    }
+                    
+                    // Combine high chunks to compute the high chunk diff.
+                    minisketch_merge(working_sketch_high, local_sketch_high);
+                }
+
+                // Attempt to decode the set difference (high chunk).
+                uint64_t differences_high_chunk[RECONCIL_MAX_DIFF];
+                num_differences = minisketch_decode(working_sketch_high, RECONCIL_MAX_DIFF, differences_high_chunk);
+                bool high_chunk_decoded = num_differences >= 0;
+
+                if (high_chunk_decoded) {
+                    // High chunk decoded and low chunk decoded. Bisection fully succeeded.
+                    // Request and send only transactions which were identified to be missing.
+
+                    LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i succeded after bisection (high chunk)\n", pfrom->GetId());
+                    std::vector<uint32_t> local_missing_high;
+                    std::vector<uint256> remote_missing_high = pfrom->GetRelevantIDsFromShortIDs(differences_high_chunk, num_differences, local_missing_high, connman);
+                    local_missing.insert(local_missing.end(), local_missing_high.begin(), local_missing_high.end());
+                    remote_missing.insert(remote_missing.end(), remote_missing_high.begin(), remote_missing_high.end());
+                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_SUCCESS), local_missing));
+                    AnnounceTxs(remote_missing, pfrom, msgMaker, connman);
+                    pfrom->FinalizeReconciliation(false, CNode::LocalQAction::Q_RECOMPUTE, local_missing.size(), remote_missing.size());
+                } else {
+                    // High chunk failed to decode and Low chunk decoded. Bisection partially succeeded.
+                    // From the high chunk, send all transactions. From the low chunk, send and request those identified to be missing.
+                    // The peer will announce their transactions from the high chunk to us.
+
+                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_HIGH_FAILED), local_missing));
+                    for (uint256 wtxid: pfrom->m_recon_state->local_set_snapshot) {
+                        uint32_t short_txid = pfrom->ComputeShortID(wtxid);
+                        if (short_txid > BISECTION_MEDIAN) // use only high chunk, low chunk transactions are already in the vector
+                            remote_missing.push_back(wtxid);
+                    }
+                    AnnounceTxs(remote_missing, pfrom, msgMaker, connman);
+                    LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i failed after bisection (high chunk)\n", pfrom->GetId());
+                    pfrom->FinalizeReconciliation(false, CNode::LocalQAction::Q_INCREASE);
+                }
+            }
+            return true;
+        } else {
+            // Reconciliation over the current working chunk failed.
+            if (pfrom->m_recon_state->outgoing_recon == CNode::ReconPhase::INIT_REQUESTED) {
+                // Initial reconciliation failed.
+                // Store the received sketch and the local sketch, request bisection.
+                
+                assert(remote_sketch != nullptr);
+                // Prepare to request bisection.
+                pfrom->m_recon_state->remote_sketch_snapshot = minisketch_clone(remote_sketch);
+                if (local_sketch != nullptr) {
+                    pfrom->m_recon_state->local_sketch_snapshot = minisketch_clone(local_sketch);
+                }
+                pfrom->m_recon_state->local_set_snapshot = pfrom->m_recon_state->local_set;
+                pfrom->m_recon_state->local_set.clear();
+                LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i initially failed, requesting bisection\n", pfrom->GetId());
+                connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::REQBISEC));
+                pfrom->m_recon_state->outgoing_recon = CNode::ReconPhase::BISEC_REQUESTED;
+            } else {
+                // Reconciliation over the low chunk failed during bisection.
+                // Announce all local transactions from the low chunk.
+                // Attempt to reconstruct the difference from locally computed high chunk.               
+
+                LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i failed after bisection (low chunk)\n", pfrom->GetId());
+                assert(pfrom->m_recon_state->remote_sketch_snapshot != nullptr); // Otherwise should have been cancelled
+                minisketch* working_sketch_high = minisketch_clone(pfrom->m_recon_state->remote_sketch_snapshot);
+                minisketch_merge(working_sketch_high, remote_sketch); // Sketch of the remote high chunk
+
+                // Empty snapshot implies there were no transactions locally
+                if (pfrom->m_recon_state->local_sketch_snapshot != nullptr) {
+                    minisketch* local_sketch_high = minisketch_clone(pfrom->m_recon_state->local_sketch_snapshot);
+                    if (local_sketch != nullptr) {
+                        minisketch_merge(local_sketch_high, local_sketch); // Sketch of the local high chunk
+                    }
+                    minisketch_merge(working_sketch_high, local_sketch_high); // Sketch of the difference in high chunks
+                }
+
+                // Attempt to find difference in high chunks
+                uint64_t differences_high_chunk[RECONCIL_MAX_DIFF];
+                num_differences = minisketch_decode(working_sketch_high, RECONCIL_MAX_DIFF, differences_high_chunk);
+                bool high_chunk_decoded = num_differences >= 0;
+
+                std::vector<uint256> remote_missing;
+                if (high_chunk_decoded) {
+                    // Reconciliation over the high chunks succeeded.
+                    // Send/request only missing transactions from the high chunk, and send all from the low (because low failed).
+                    // Can't request missing low because we have no idea which those are, but peer will send them after finding out
+                    // that low chunk decoding failed.
+                    
+                    LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i succeded after bisection (high chunk)\n", pfrom->GetId());
+                    std::vector<uint32_t> local_missing_high;
+                    remote_missing = pfrom->GetRelevantIDsFromShortIDs(differences_high_chunk, num_differences, local_missing_high, connman);
+                    for (uint256 local_wtxid: pfrom->m_recon_state->local_set_snapshot) {
+                        uint32_t short_id = pfrom->ComputeShortID(local_wtxid);
+                        if (short_id <= BISECTION_MEDIAN) {
+                            remote_missing.push_back(local_wtxid);
+                        }
+                    }
+                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_LOW_FAILED), local_missing_high));
+                    pfrom->FinalizeReconciliation(false, CNode::LocalQAction::Q_INCREASE);
+                } else {
+                    // Reconciliation over the high chunks also failed.
+                    // Announce all local transactions.
+                    // All remote transactions will be announced by peer due to the reconciliation failure flag.
+
+                    LogPrint(BCLog::NET, "Outgoing reconciliation with peer=%i failed after bisection (high chunk)\n", pfrom->GetId());
+                    remote_missing.insert(remote_missing.end(), pfrom->m_recon_state->local_set_snapshot.begin(), pfrom->m_recon_state->local_set_snapshot.end());
+                    connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::RECONCILDIFF, uint8_t(RECON_FAILED), std::vector<uint32_t>()));
+                    pfrom->FinalizeReconciliation(false, CNode::LocalQAction::Q_SET_DEFAULT);
+                }
+                AnnounceTxs(remote_missing, pfrom, msgMaker, connman);
+            }
+        }
+        return true;
+    }
+
+    // Peer requesting bisection after initial reconciliation failed on their side.
+    // No privacy leak can happen here because bisection sketch is constructed over the snapshot.
+    if (strCommand == NetMsgType::REQBISEC) {
+        if (pfrom->m_recon_state->incoming_recon != CNode::ReconPhase::INIT_RESPONDED) return true;
+        pfrom->m_recon_state->incoming_recon = CNode::ReconPhase::BISEC_REQUESTED;
+        return true;
+    }
+
+    // Privacy leak can't happen here, because we will consider only those
+    // transactions which were sketched (stored in local set snapshot).
+    if (strCommand == NetMsgType::RECONCILDIFF) {
+        if (pfrom->m_recon_state->incoming_recon != CNode::ReconPhase::INIT_RESPONDED &&
+            pfrom->m_recon_state->incoming_recon != CNode::ReconPhase::BISEC_RESPONDED) return true;
+        uint8_t success_value;
+        std::vector<uint32_t> ask_shortids;
+        vRecv >> success_value >> ask_shortids;
+        ReconResult success = static_cast<ReconResult>(success_value);
+        std::vector<uint256> remote_missing;
+        if (success == RECON_SUCCESS) {
+            remote_missing = pfrom->GetWTXIDsFromShortIDs(ask_shortids, connman);
+        } else if (success == RECON_FAILED) {
+            remote_missing.insert(remote_missing.end(), pfrom->m_recon_state->local_set_snapshot.begin(), pfrom->m_recon_state->local_set_snapshot.end());
+        } else {
+            for (uint256 wtxid: pfrom->m_recon_state->local_set_snapshot) {
+                uint32_t short_id = pfrom->ComputeShortID(wtxid);
+                // No matter which chunk failed, always announce what is asked for by short id
+                if (std::find(ask_shortids.begin(), ask_shortids.end(), short_id) != ask_shortids.end()) {
+                    remote_missing.push_back(wtxid);
+                }
+                if (success == RECON_LOW_FAILED) {
+                    // High chunk bisection succeeded and asked for in ask_shortid, announce only remaining from the low chunk.
+                    if (short_id <= BISECTION_MEDIAN) {
+                        remote_missing.push_back(wtxid);
+                    }
+                } else if (success == RECON_HIGH_FAILED) { 
+                    // Low chunk bisection succeeded and asked for in ask_shortid, announce only remaining from the high chunk
+                    if (short_id > BISECTION_MEDIAN) {
+                        remote_missing.push_back(wtxid);
+                    }
+                }
+            }
+        }
+        AnnounceTxs(remote_missing, pfrom, msgMaker, connman);
+        pfrom->FinalizeReconciliation(false);
+        return true;
+    }
+
     // Ignore unknown commands for extensibility
     LogPrint(BCLog::NET, "Unknown command \"%s\" from peer=%d\n", SanitizeString(strCommand), pfrom->GetId());
     return true;
@@ -4150,6 +4448,74 @@ bool PeerLogicValidation::SendMessages(CNode* pto)
         }
         if (!vInv.empty())
             connman->PushMessage(pto, msgMaker.Make(NetMsgType::INV, vInv));
+        //
+        // Message: reconciliation request
+        //
+        if (connman->m_recon_queue.size() > 0) {
+            // Request transaction reconciliation periodically to efficiently exchange transactions.
+            // To make reconciliation predictable and efficient, we reconcile with peers in order based on the queue,
+            // and with a delay between requests.
+            if (connman->m_next_recon_request < current_time && connman->m_recon_queue.back() == pto) {
+                assert(pto->m_recon_state->responder); // Should not be in the queue otherwise
+                if (pto->m_recon_state->outgoing_recon != CNode::ReconPhase::NONE) {
+                    // Do not initiate a new reconciliation if the old one is still in progress
+                    LogPrint(BCLog::NET, "Previous reconciliation with peer=%d is still ongoing, not initiating a new one\n", pto->GetId());
+                } else {
+                    uint16_t local_recon_set_size = pto->m_recon_state->local_set.size();
+                    uint16_t q(pto->m_recon_state->local_q * Q_PRECISION);
+                    connman->PushMessage(pto, msgMaker.Make(NetMsgType::REQRECON, local_recon_set_size, q));
+                    pto->m_recon_state->outgoing_recon = CNode::ReconPhase::INIT_REQUESTED;
+                }
+                connman->UpdateNextReconRequest(current_time);
+                connman->m_recon_queue.pop_back();
+                connman->m_recon_queue.push_front(pto);
+            }
+        }
+
+        //
+        // Message: reconciliation response
+        //
+        if (pto->m_recon_state) {
+            // Respond to a requested reconciliation to enable efficient transaction exchange.
+            bool recon_requested = (pto->m_recon_state->incoming_recon == CNode::ReconPhase::INIT_REQUESTED) ||
+                (pto->m_recon_state->incoming_recon == CNode::ReconPhase::BISEC_REQUESTED);
+            // Respond only periodically to a) limit CPU usage for sketch computation,
+            // and, b) limit transaction posesssion privacy leak.
+            if (recon_requested && current_time > pto->m_recon_state->next_recon_respond) {
+                std::vector<uint8_t> response_skdata;
+                minisketch* response_sketch;
+                if (pto->m_recon_state->incoming_recon == CNode::ReconPhase::INIT_REQUESTED) {
+                    // Initial reconciliation request, compute a sketch over all transactions from the reconciliation set.
+                    response_sketch = pto->ComputeSketch(false, CNode::BisectionChunk::BISECTION_NONE);
+                } else {
+                    // Bisection request, compute a sketch over the low chunk of transactions from the reconciliation set.
+                    // Due to the linearity properties, this would allow the peer to construct our sketch over the high chunk,
+                    // from our initial sketch and our Low chunk sketch.
+                    response_sketch = pto->ComputeSketch(false, CNode::BisectionChunk::BISECTION_LOW);
+                }
+                if (response_sketch != nullptr) {
+                    // It is possible to create a sketch if we had at least one transaction to send to the peer.
+                    size_t ser_size = minisketch_serialized_size(response_sketch);
+                    uint8_t skdata[MAX_SKETCH_CAPACITY * BYTES_PER_SKETCH_ELEMENT];
+                    minisketch_serialize(response_sketch, skdata);
+                    response_skdata.resize(ser_size);
+                    std::copy(skdata, skdata + ser_size, response_skdata.begin());
+                }
+                connman->PushMessage(pto, msgMaker.Make(NetMsgType::SKETCH, response_skdata));
+                
+                if (pto->m_recon_state->incoming_recon == CNode::ReconPhase::INIT_REQUESTED) {
+                    pto->m_recon_state->incoming_recon = CNode::ReconPhase::INIT_RESPONDED;
+                    // Be ready to respond to bisection request, to compute the bisection sketch over
+                    // the same initial set (without transactions received during the reconciliation).
+                    // Allow to store new transactions separately in the original set.
+                    pto->m_recon_state->local_set_snapshot = pto->m_recon_state->local_set;
+                    pto->m_recon_state->local_set.clear();
+                }
+                else if (pto->m_recon_state->incoming_recon == CNode::ReconPhase::BISEC_REQUESTED) {
+                    pto->m_recon_state->incoming_recon = CNode::ReconPhase::BISEC_RESPONDED;
+                }
+            }
+        }
 
         // Detect whether we're stalling
         current_time = GetTime<std::chrono::microseconds>();

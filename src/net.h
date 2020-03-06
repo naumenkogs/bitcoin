@@ -32,6 +32,8 @@
 #include <condition_variable>
 #include "minisketch/include/minisketch.h"
 
+#include "minisketch/include/minisketch.h"
+
 #ifndef WIN32
 #include <arpa/inet.h>
 #endif
@@ -91,11 +93,29 @@ static const bool DEFAULT_FORCEDNSSEED = false;
 static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
+// The size of the field, used to compute sketches to reconcile transactions.
+static constexpr unsigned int RECON_FIELD_SIZE = 32;
+static_assert(RECON_FIELD_SIZE % 8 == 0, "Field size should be divisible by 8");
+/** The size of the field, used to compute sketches to reconcile transactions. */
+static constexpr unsigned int BYTES_PER_SKETCH_ELEMENT = RECON_FIELD_SIZE / 8;
+/** Separating value used in reconciliation bisection */
+static constexpr uint32_t BISECTION_MEDIAN = 2 << (RECON_FIELD_SIZE - 2);
 // Limit flooding through outbound peers. For the rest of outbound peers
 // and all inbound peers, use reconciliation if supported by peer. Otherwise, flood.
 static constexpr uint32_t MAX_OUTBOUND_FLOOD_TO = 8;
+/* Interval between responding to peers' reconciliation requests to prevent tx posession privacy leaks. */
+static constexpr std::chrono::microseconds RECON_RESPONSE_INTERVAL{std::chrono::seconds{2}};
+// Interval between sending reconciliation request to the same peer from the reconciliation queue
+// This value allows to reconcile ~100 transactions during normal system operation at capacity.
+// More frequent reconciliations would cause significant constant bandwidth overhead due to
+// reconciliation metadata (sketch sizes etc.), which would nullify the efficiency.
+// Less frequent reconciliations would introduce high transaction relay latency.
+static constexpr std::chrono::microseconds RECON_REQUEST_INTERVAL{std::chrono::seconds{16}};
 // Default coefficient used to estimate set difference for tx reconciliation;
 static constexpr double DEFAULT_RECON_Q = 0.01;
+// Bound on the sketch capacity (in field elements) to limit computation in unexpected cases.
+static constexpr uint16_t MAX_SKETCH_CAPACITY = 2 << 12;
+
 typedef int64_t NodeId;
 
 struct AddedNodeInfo
@@ -347,6 +367,15 @@ public:
     int64_t PoissonNextSendInbound(int64_t now, int average_interval_seconds);
 
     void SetAsmap(std::vector<bool> asmap) { addrman.m_asmap = asmap; }
+    // Used to schedule the next reconciliation with a peer from the queue
+    std::chrono::microseconds m_next_recon_request{0};
+    void UpdateNextReconRequest(std::chrono::microseconds now);
+
+    // Used to schedule the next initial response for any pending reconciliation request.
+    // Respond to all requests at the same time to prevent transaction posession leak.
+    std::chrono::microseconds m_next_recon_respond{0};
+    std::chrono::microseconds NextReconRespond(std::chrono::microseconds now);
+
     // Tracks with which peer we should reconcile next.
     std::deque<CNode*> m_recon_queue;
 
@@ -928,6 +957,52 @@ public:
     ~CNode();
     CNode(const CNode&) = delete;
     CNode& operator=(const CNode&) = delete;
+
+    
+    // Recompute q in case of full reconciliation success (both initially or after bisection).
+    // In case if *one* chunk of the bisection fails, slightly increase q, because it usually just means that
+    // the distribution of values was uneven.
+    // In case reconciliation completely failed (initial and both chunks of bisection), fallback to the default q,
+    // set to cause an overestimation, but should converge to the reasonable q in the next round.
+    // Accurate recompute in case of complete failue is difficult, because it requires waiting for GETDATA/INV the peer
+    // would send to us, and find the actual difference from there (also may be inaccurate due to the latencies).
+    enum LocalQAction {
+        Q_KEEP,
+        Q_RECOMPUTE,
+        Q_INCREASE,
+        Q_SET_DEFAULT
+    };
+    // Clears the state of the peer when the reconciliation is done.
+    // If this is (incoming/outgoing) bisection finalization, keep the reconciliation set to track
+    // the transactions received from other peers during the reconciliation.
+    // Also keep the set if this if finalizing initial incoming reconciliation, because
+    // there was a time frame when we sent out an initial sketch until peer responded
+    // If finalizing initial outgoing reconciliation it is safe to clear the set,
+    // because we do not use the snapshot, but sketch the original set (which might have received
+    // few new transactions), and finalize reconciliation immediately.
+    void FinalizeReconciliation(bool clear_local_set, LocalQAction action=LocalQAction::Q_KEEP,
+        uint8_t actual_local_missing=0, uint8_t actual_remote_missing=0);
+
+    // Computes per-peer salted short ids used to compute sketches for tx reconciliation.
+    uint32_t ComputeShortID(const uint256 wtxid);
+
+    // Communicates whether the sketch should be computed over the full set,
+    // or over the transactions, short ids of which belong to the lowest half
+    // of the space.
+    enum BisectionChunk {
+        BISECTION_NONE,
+        BISECTION_LOW,
+    };
+
+    // If capacity=0, estimate set difference locally.
+    minisketch* ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk=BISECTION_NONE, uint16_t capacity=0);
+
+    // Returns wtxids for transactions peer is missing and short txids for transactions we are missing.
+    std::vector<uint256> GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t> &local_missing, CConnman *connman);
+
+    // Returns wtxids for reconciled transactions by their short id.
+    std::vector<uint256> GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman *connman);
+
 
 private:
     const NodeId id;
