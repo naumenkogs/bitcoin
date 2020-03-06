@@ -80,7 +80,7 @@ TransactionError BroadcastTransaction(NodeContext& node, const CTransactionRef t
 
     if (relay) {
         LOCK(cs_main);
-        RelayTransaction(hashTx, tx->GetWitnessHash(), *node.connman);
+        RelayTransaction(hashTx, tx->GetWitnessHash(), *node.connman, false);
     }
 
     return TransactionError::OK;

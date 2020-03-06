@@ -283,6 +283,8 @@ public:
     // Used to determine whether we should flood to a new peer
     // which supports reconciliation, in case we haven't reached
     // the outbound flooding bandwidth-conserving limit.
+    // Also used to weighten diffusion delay and limit tining attacks
+    // by updated malicious reachable nodes.
     uint64_t GetOutboundCountByTxRelayType(bool flooding);
 
     bool AddNode(const std::string& node);
@@ -823,9 +825,10 @@ public:
 
         mutable RecursiveMutex cs_tx_inventory;
         CRollingBloomFilter filterInventoryKnown GUARDED_BY(cs_tx_inventory){50000, 0.000001};
-        // Set of transaction ids we still have to announce.
-        // They are sorted by the mempool before relay, so the order is not important.
-        std::set<uint256> setInventoryTxToSend;
+        // Set of transaction ids we still have to announce, and whether we may flood them
+        // in case if peer is meant to receive flooding, as opposed to reconcile.
+        // Transactions are sorted by the mempool before relay, so the order is not important.
+        std::map<uint256, bool> setInventoryTxToSend;
         // Used for BIP35 mempool sending
         bool fSendMempool GUARDED_BY(cs_tx_inventory){false};
         // Last time a "MEMPOOL" request was serviced.
@@ -1038,12 +1041,12 @@ public:
         }
     }
 
-    void PushInventory(const CInv& inv)
+    void PushInventory(const CInv& inv, bool flood=false)
     {
         if ((inv.type == MSG_TX || inv.type == MSG_WTX) && m_tx_relay != nullptr) {
             LOCK(m_tx_relay->cs_tx_inventory);
             if (!m_tx_relay->filterInventoryKnown.contains(inv.hash)) {
-                m_tx_relay->setInventoryTxToSend.insert(inv.hash);
+                m_tx_relay->setInventoryTxToSend.insert(std::pair<uint256, bool>(inv.hash, flood));
             }
         } else if (inv.type == MSG_BLOCK) {
             LOCK(cs_inventory);
