@@ -56,6 +56,24 @@ class TxReconciliationTracker {
      * Removes any reconciliation-related state/notion of the peer.
      */
     void RemovePeer(const NodeId peer_id);
+
+    /**
+     * Returns whether a given peer might respond to our reconciliation requests.
+     * If the peer was not previously registered for reconciliations, returns nullopt.
+     */
+    std::optional<bool> IsPeerResponder(const NodeId peer_id) const;
+
+    /**
+     * Returns the size of the reconciliation set we have locally for the given peer.
+     * If the peer was not previously registered for reconciliations, returns nullopt.
+     */
+    std::optional<size_t> GetPeerSetSize(const NodeId peer_id) const;
+
+    /**
+     * Adds new transactions we want to announce to the peer to the local reconciliation set of the
+     * peer, so that those transactions will be reconciled later.
+     */
+    void StoreTxsToAnnounce(const NodeId peer_id, const std::vector<uint256>& txs_to_reconcile);
 };
 
 #endif // BITCOIN_TXRECONCILIATION_H
