@@ -192,6 +192,14 @@ class TxReconciliationTracker::Impl {
         return true;
     }
 
+    void RemovePeer(const NodeId peer_id)
+    {
+        LOCK(m_mutex);
+        m_queue.erase(std::remove(m_queue.begin(), m_queue.end(), peer_id), m_queue.end());
+        m_local_salts.erase(peer_id);
+        m_states.erase(peer_id);
+    }
+
 };
 
 TxReconciliationTracker::TxReconciliationTracker() :
@@ -215,4 +223,9 @@ bool TxReconciliationTracker::EnableReconciliationSupport(const NodeId peer_id, 
 std::optional<bool> TxReconciliationTracker::IsPeerChosenForFlooding(const NodeId peer_id) const
 {
     return m_impl->IsPeerChosenForFlooding(peer_id);
+}
+
+void TxReconciliationTracker::RemovePeer(const NodeId peer_id)
+{
+    m_impl->RemovePeer(peer_id);
 }
