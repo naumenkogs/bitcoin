@@ -238,6 +238,28 @@ struct ReconciliationState {
         }
         return remote_missing;
     }
+
+    /**
+     * Once we are fully done with the incoming reconciliation, prepare the state for the following
+     * reconciliations in the same direction.
+     */
+    void FinalizeIncomingReconciliation()
+    {
+        assert(m_requestor);
+        m_local_short_id_mapping.clear();
+    }
+
+    /**
+     * Once we are fully done with the outgoing reconciliation, prepare the state for the following
+     * reconciliations in the same direction.
+     */
+    void FinalizeOutgoingReconciliation(bool clear_local_set, double updated_q)
+    {
+        assert(m_responder);
+        m_local_q = updated_q;
+        if (clear_local_set) m_local_set.clear();
+        m_local_short_id_mapping.clear();
+    }
 };
 
 } // namespace
@@ -472,6 +494,30 @@ class TxReconciliationTracker::Impl {
         return response_skdata;
     }
 
+    std::vector<uint256> FinalizeIncomingReconciliation(const NodeId peer_id, bool recon_result,
+        const std::vector<uint32_t>& ask_shortids)
+    {
+        std::vector<uint256> remote_missing;
+        LOCK(m_mutex);
+        auto recon_state = m_states.find(peer_id);
+        if (recon_state == m_states.end()) return remote_missing;
+
+        assert(recon_state->second.m_requestor);
+        const auto incoming_phase = recon_state->second.m_incoming_recon;
+        const bool phase_init_responded = incoming_phase == RECON_INIT_RESPONDED;
+
+        if (!phase_init_responded) return remote_missing;
+
+        if (recon_result) {
+            remote_missing = recon_state->second.GetWTXIDsFromShortIDs(ask_shortids);
+        } else {
+            remote_missing = std::vector<uint256>(recon_state->second.m_local_set.begin(), recon_state->second.m_local_set.end());
+        }
+        recon_state->second.FinalizeIncomingReconciliation();
+        recon_state->second.m_incoming_recon = RECON_NONE;
+        return remote_missing;
+    }
+
 };
 
 TxReconciliationTracker::TxReconciliationTracker() :
@@ -530,4 +576,10 @@ void TxReconciliationTracker::HandleReconciliationRequest(const NodeId peer_id, 
 std::optional<std::vector<uint8_t>> TxReconciliationTracker::MaybeRespondToReconciliationRequest(const NodeId peer_id)
 {
     return m_impl->MaybeRespondToReconciliationRequest(peer_id);
+}
+
+std::vector<uint256> TxReconciliationTracker::FinalizeIncomingReconciliation(const NodeId peer_id,
+    bool recon_result, const std::vector<uint32_t>& ask_shortids)
+{
+    return m_impl->FinalizeIncomingReconciliation(peer_id, recon_result, ask_shortids);
 }
