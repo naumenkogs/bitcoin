@@ -680,6 +680,15 @@ class TxReconciliationTracker::Impl {
         }
     }
 
+    void HandleIncomingExtensionRequest(const NodeId peer_id)
+    {
+        LOCK(m_mutex);
+        auto recon_state = m_states.find(peer_id);
+        if (recon_state == m_states.end()) return;
+        if (recon_state->second.m_incoming_recon != RECON_INIT_RESPONDED) return;
+        recon_state->second.m_incoming_recon = RECON_EXT_REQUESTED;
+    }
+
 };
 
 TxReconciliationTracker::TxReconciliationTracker() :
@@ -750,4 +759,9 @@ std::optional<std::tuple<bool, bool, std::vector<uint32_t>, std::vector<uint256>
     const NodeId peer_id, int common_version, std::vector<uint8_t>& skdata)
 {
     return m_impl->HandleSketch(peer_id, common_version, skdata);
+}
+
+void TxReconciliationTracker::HandleIncomingExtensionRequest(const NodeId peer_id)
+{
+    m_impl->HandleIncomingExtensionRequest(peer_id);
 }
