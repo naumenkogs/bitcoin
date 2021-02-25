@@ -351,6 +351,20 @@ struct ReconciliationState {
     /**
      * TODO document
      */
+    void PrepareForExtensionRequest(uint16_t sketch_capacity)
+    {
+        // Be ready to respond to extension request, to compute the extended sketch over
+        // the same initial set (without transactions received during the reconciliation).
+        // Allow to store new transactions separately in the original set.
+        assert(m_requestor);
+        m_capacity_snapshot = sketch_capacity;
+        m_local_set_snapshot = m_local_set;
+        m_local_set.clear();
+    }
+
+    /**
+     * TODO document
+     */
     void PrepareForExtensionResponse(uint16_t sketch_capacity, const std::vector<uint8_t>& remote_sketch)
     {
         assert(m_responder);
@@ -589,6 +603,7 @@ class TxReconciliationTracker::Impl {
         uint16_t sketch_capacity = recon_state->second.EstimateSketchCapacity();
         Minisketch sketch = recon_state->second.ComputeSketch(sketch_capacity);
         recon_state->second.m_incoming_recon = RECON_INIT_RESPONDED;
+        recon_state->second.PrepareForExtensionRequest(sketch_capacity);
         if (sketch) response_skdata = sketch.Serialize();
         return response_skdata;
     }
