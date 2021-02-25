@@ -10,6 +10,11 @@ namespace {
 
 /** The size of the field, used to compute sketches to reconcile transactions (see BIP-330). */
 constexpr unsigned int RECON_FIELD_SIZE = 32;
+/**
+ * Allows to infer capacity of a reconciliation sketch based on it's char[] representation,
+ * which is necessary to deserealize a received sketch.
+ */
+constexpr unsigned int BYTES_PER_SKETCH_CAPACITY = RECON_FIELD_SIZE / 8;
 /** Limit sketch capacity to avoid DoS. */
 constexpr uint16_t MAX_SKETCH_CAPACITY = 2 << 12;
 /**
@@ -69,6 +74,44 @@ uint256 ComputeSalt(uint64_t local_salt, uint64_t remote_salt)
     if (salt1 > salt2) std::swap(salt1, salt2);
     static const auto RECON_SALT_HASHER = TaggedHash(RECON_STATIC_SALT);
     return (CHashWriter(RECON_SALT_HASHER) << salt1 << salt2).GetSHA256();
+}
+
+/**
+ * TODO: comment
+ */
+std::optional<std::pair<Minisketch, uint16_t>> ParseRemoteSketch(const std::vector<uint8_t>& skdata)
+{
+    uint16_t remote_sketch_capacity = uint16_t(skdata.size() / BYTES_PER_SKETCH_CAPACITY);
+    if (remote_sketch_capacity != 0) {
+        Minisketch remote_sketch = Minisketch(RECON_FIELD_SIZE, 0, remote_sketch_capacity).Deserialize(skdata);
+        return std::make_pair(remote_sketch, remote_sketch_capacity);
+    } else {
+        return std::nullopt;
+    }
+}
+
+/**
+ * After a reconciliation round is over, the local q coefficient may be adjusted to enable
+ * better accuracy of future set difference estimations.
+ * Recompute q in case of full reconciliation success (both initially or after extension).
+ * In case reconciliation completely failed (initial and extension), fallback to the default q,
+ * set to cause an overestimation, but should converge to the reasonable q in the next round.
+ * Note that accurate recompute in case of complete failure is difficult,
+ * because it requires waiting for GETDATA/INV the peer would send to us, and find
+ * the actual difference from there (also may be inaccurate due to the latencies).
+ */
+double RecomputeQ(uint8_t local_set_size, uint8_t actual_local_missing, uint8_t actual_remote_missing)
+{
+    const uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;
+    const uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);
+    const uint8_t min_size = std::min(local_set_size, remote_set_size);
+    const uint8_t actual_difference = actual_local_missing + actual_remote_missing;
+    if (min_size != 0) {
+        double result = double(actual_difference - set_size_diff) / min_size;
+        assert(result >= 0 && result <= 2);
+        return result;
+    }
+    return DEFAULT_RECON_Q;
 }
 
 /**
@@ -538,6 +581,65 @@ class TxReconciliationTracker::Impl {
         return remote_missing;
     }
 
+    std::optional<std::tuple<bool, std::vector<uint32_t>, std::vector<uint256>>> HandleSketch(
+        const NodeId peer_id, int common_version, std::vector<uint8_t>& skdata)
+    {
+        if (skdata.size() / BYTES_PER_SKETCH_CAPACITY > MAX_SKETCH_CAPACITY) {
+            return std::nullopt;
+        }
+
+        LOCK(m_mutex);
+        auto recon_state = m_states.find(peer_id);
+        if (recon_state == m_states.end()) return std::nullopt;
+
+        assert(recon_state->second.m_responder);
+
+        const auto outgoing_phase = recon_state->second.m_outgoing_recon;
+        const bool phase_init_requested = outgoing_phase == RECON_INIT_REQUESTED;
+
+        if (!phase_init_requested) return std::nullopt;
+
+        Minisketch remote_sketch;
+        uint16_t remote_sketch_capacity = 0;
+        auto parsed_remote_sketch = ParseRemoteSketch(skdata);
+        if (parsed_remote_sketch) {
+            remote_sketch = (*parsed_remote_sketch).first;
+            remote_sketch_capacity = (*parsed_remote_sketch).second;
+        }
+
+        Minisketch local_sketch = recon_state->second.ComputeSketch(remote_sketch_capacity);
+
+        if (remote_sketch_capacity == 0 || !remote_sketch || !local_sketch) {
+            LogPrint(BCLog::NET, "Outgoing reconciliation failed due to %s \n",
+                remote_sketch_capacity == 0 ? "empty sketch" : "minisketch API failure");
+            std::vector<uint256> remote_missing = std::vector<uint256>(recon_state->second.m_local_set.begin(), recon_state->second.m_local_set.end());
+            recon_state->second.FinalizeOutgoingReconciliation(true, DEFAULT_RECON_Q);
+            recon_state->second.m_outgoing_recon = RECON_NONE;
+            return std::make_tuple(false, std::vector<uint32_t>(), remote_missing);
+        }
+
+        assert(remote_sketch);
+        assert(local_sketch);
+        // Attempt to decode the set difference
+        std::vector<uint64_t> differences(remote_sketch_capacity);
+        if (local_sketch.Merge(remote_sketch).Decode(differences)) {
+            // Reconciliation over the current working sketch succeeded
+            LogPrint(BCLog::NET, "Outgoing reconciliation succeeded\n");
+            auto missing_txs = recon_state->second.GetRelevantIDsFromShortIDs(differences);
+            std::vector<uint32_t> local_missing = missing_txs.first;
+            std::vector<uint256> remote_missing = missing_txs.second;
+
+            size_t local_set_size = recon_state->second.m_local_set.size();
+            recon_state->second.FinalizeOutgoingReconciliation(true, RecomputeQ(local_set_size, local_missing.size(), remote_missing.size()));
+            recon_state->second.m_outgoing_recon = RECON_NONE;
+            return std::make_tuple(true, local_missing, remote_missing);
+        } else {
+            // Reconciliation over the current working sketch failed.
+            // TODO handle failure.
+            return std::nullopt;
+        }
+    }
+
 };
 
 TxReconciliationTracker::TxReconciliationTracker() :
@@ -602,4 +704,10 @@ std::vector<uint256> TxReconciliationTracker::FinalizeIncomingReconciliation(con
     bool recon_result, const std::vector<uint32_t>& ask_shortids)
 {
     return m_impl->FinalizeIncomingReconciliation(peer_id, recon_result, ask_shortids);
+}
+
+std::optional<std::tuple<bool, std::vector<uint32_t>, std::vector<uint256>>> TxReconciliationTracker::HandleSketch(
+    const NodeId peer_id, int common_version, std::vector<uint8_t>& skdata)
+{
+    return m_impl->HandleSketch(peer_id, common_version, skdata);
 }
