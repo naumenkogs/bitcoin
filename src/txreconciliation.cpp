@@ -62,7 +62,8 @@ enum ReconciliationPhase {
     RECON_NONE,
     RECON_INIT_REQUESTED,
     RECON_INIT_RESPONDED,
-    RECON_EXT_REQUESTED
+    RECON_EXT_REQUESTED,
+    RECON_EXT_RESPONDED
 };
 
 /**
@@ -267,14 +268,22 @@ struct ReconciliationState {
      * (a sketch). A sketch has a capacity meaning it allows reconciling at most a certain number
      * of elements (see BIP-330).
      */
-    Minisketch ComputeSketch(uint16_t capacity)
+    Minisketch ComputeSketch(uint16_t capacity, bool use_snapshot=false)
     {
         Minisketch sketch;
+        std::set<uint256> working_set;
+
+        if (use_snapshot) {
+            working_set = m_local_set_snapshot;
+        } else {
+            working_set = m_local_set;
+            m_capacity_snapshot = capacity;
+        }
         // Avoid serializing/sending an empty sketch.
-        if (m_local_set.size() == 0 || capacity == 0) return sketch;
+        if (working_set.size() == 0 || capacity == 0) return sketch;
 
         std::vector<uint32_t> short_ids;
-        for (const auto& wtxid: m_local_set) {
+        for (const auto& wtxid: working_set) {
             uint32_t short_txid = ComputeShortID(wtxid);
             short_ids.push_back(short_txid);
             m_local_short_id_mapping.emplace(short_txid, wtxid);
@@ -288,6 +297,20 @@ struct ReconciliationState {
             }
         }
         return sketch;
+    }
+
+    Minisketch GetLocalBaseSketch(uint16_t capacity)
+    {
+        return ComputeSketch(capacity, false);
+    }
+
+    Minisketch GetLocalExtendedSketch()
+    {
+        // For now, compute a sketch of twice the capacity were computed originally.
+        // TODO: optimize by computing the extension *on top* of the existent sketch
+        // instead of computing the lower order elements again.
+        const uint16_t extended_capacity = m_capacity_snapshot * 2;
+        return ComputeSketch(extended_capacity, true);
     }
 
     /**
@@ -595,16 +618,32 @@ class TxReconciliationTracker::Impl {
 
         auto incoming_phase = recon_state->second.m_incoming_recon;
         bool timely_initial_request = incoming_phase == RECON_INIT_REQUESTED && current_time > recon_state->second.m_next_recon_respond;
-        if (!timely_initial_request) {
+        bool extension_request = incoming_phase == RECON_EXT_REQUESTED;
+        if (!timely_initial_request && !extension_request) {
             return std::nullopt;
         }
 
         std::vector<unsigned char> response_skdata;
-        uint16_t sketch_capacity = recon_state->second.EstimateSketchCapacity();
-        Minisketch sketch = recon_state->second.ComputeSketch(sketch_capacity);
-        recon_state->second.m_incoming_recon = RECON_INIT_RESPONDED;
-        recon_state->second.PrepareForExtensionRequest(sketch_capacity);
-        if (sketch) response_skdata = sketch.Serialize();
+        Minisketch sketch;
+        if (timely_initial_request) {
+            uint16_t sketch_capacity = recon_state->second.EstimateSketchCapacity();
+            sketch = recon_state->second.GetLocalBaseSketch(sketch_capacity);
+            recon_state->second.m_incoming_recon = RECON_INIT_RESPONDED;
+            recon_state->second.PrepareForExtensionRequest(sketch_capacity);
+            if (sketch) response_skdata = sketch.Serialize();
+        } else {
+            sketch = recon_state->second.GetLocalExtendedSketch();
+            recon_state->second.m_incoming_recon = RECON_EXT_RESPONDED;
+            // Local extension sketch can be null only if initial sketch or initial capacity was 0,
+            // in which case we would have terminated reconciliation already.
+            assert(sketch);
+            response_skdata = sketch.Serialize();
+            // For the sketch extension, send only the higher sketch elements.
+            size_t lower_bytes_to_drop = recon_state->second.m_capacity_snapshot * BYTES_PER_SKETCH_CAPACITY;
+            // Extended sketch is twice the size of the initial sketch (which is m_capacity_snapshot).
+            assert(lower_bytes_to_drop <= response_skdata.size());
+            response_skdata.erase(response_skdata.begin(), response_skdata.begin() + lower_bytes_to_drop);
+        }
         return response_skdata;
     }
 
@@ -658,7 +697,7 @@ class TxReconciliationTracker::Impl {
             remote_sketch_capacity = (*parsed_remote_sketch).second;
         }
 
-        Minisketch local_sketch = recon_state->second.ComputeSketch(remote_sketch_capacity);
+        Minisketch local_sketch = recon_state->second.GetLocalBaseSketch(remote_sketch_capacity);
 
         if (remote_sketch_capacity == 0 || !remote_sketch || !local_sketch) {
             LogPrint(BCLog::NET, "Outgoing reconciliation failed due to %s \n",
