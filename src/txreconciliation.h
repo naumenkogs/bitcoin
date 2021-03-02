@@ -48,6 +48,7 @@ class TxReconciliationTracker {
     /**
      * Per BIP-330, we may want to flood certain transactions to a subset of peers with whom we
      * reconcile.
+     * If the peer was not previously registered for reconciliations, returns nullopt.
      */
     std::optional<bool> IsPeerChosenForFlooding(const NodeId peer_id) const;
 };
