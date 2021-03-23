@@ -80,6 +80,7 @@ enum class Phase {
     NONE,
     INIT_REQUESTED,
     INIT_RESPONDED,
+    EXT_REQUESTED
 };
 
 /**
@@ -256,7 +257,8 @@ public:
         return sketch;
     }
 
-    std::vector<uint256> GetAllTransactions() const {
+    std::vector<uint256> GetAllTransactions() const
+    {
         return std::vector<uint256>(m_local_set.begin(), m_local_set.end());
     }
 
@@ -345,9 +347,9 @@ private:
     }
 
     bool HandleInitialSketch(TxReconciliationState& recon_state, const NodeId peer_id,
-        const std::vector<uint8_t>& skdata,
-        // returning values
-        std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, bool& result)
+                             const std::vector<uint8_t>& skdata,
+                             // returning values
+                             std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, std::optional<bool>& result)
     {
         assert(recon_state.m_we_initiate);
         assert(recon_state.m_phase == Phase::INIT_REQUESTED);
@@ -371,7 +373,6 @@ private:
         // 2. we told the peer we have no transactions for them while initiating reconciliation.
         // In case (2), local sketch is also empty.
         if (remote_sketch_capacity == 0 || !remote_sketch || !local_sketch) {
-
             // Announce all transactions we have.
             txs_to_announce = recon_state.GetAllTransactions();
 
@@ -382,7 +383,8 @@ private:
             result = false;
 
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Reconciliation we initiated with peer=%d terminated due to empty sketch. "
-                "Announcing all %i transactions from the local set.\n", peer_id, txs_to_announce.size());
+                                 "Announcing all %i transactions from the local set.\n",
+                     peer_id, txs_to_announce.size());
 
             return true;
         }
@@ -404,11 +406,18 @@ private:
 
             result = true;
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Reconciliation we initiated with peer=%d has succeeded at initial step, "
-                "request %i txs, announce %i txs.\n", peer_id, txs_to_request.size(), txs_to_announce.size());
+                                 "request %i txs, announce %i txs.\n",
+                     peer_id, txs_to_request.size(), txs_to_announce.size());
         } else {
             // Initial reconciliation step failed.
-            // TODO handle failure.
-            result = false;
+
+            // Update local reconciliation state for the peer.
+            recon_state.m_phase = Phase::EXT_REQUESTED;
+
+            result = std::nullopt;
+
+            LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Reconciliation we initiated with peer=%d has failed at initial step, "
+                "request sketch extension.\n", peer_id);
         }
         return true;
     }
@@ -688,14 +697,15 @@ public:
         recon_state.m_phase = Phase::INIT_RESPONDED;
 
         LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Responding with a sketch to reconciliation initiated by peer=%d: "
-            "sending sketch of capacity=%i.\n", peer_id, sketch_capacity);
+                             "sending sketch of capacity=%i.\n",
+                 peer_id, sketch_capacity);
 
         return true;
     }
 
     bool HandleSketch(NodeId peer_id, const std::vector<uint8_t>& skdata,
-        // returning values
-        std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, bool& result) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+                      // returning values
+                      std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, std::optional<bool>& result) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
     {
         AssertLockNotHeld(m_txreconciliation_mutex);
         LOCK(m_txreconciliation_mutex);
@@ -937,7 +947,7 @@ bool TxReconciliationTracker::RespondToReconciliationRequest(NodeId peer_id, std
 }
 
 bool TxReconciliationTracker::HandleSketch(NodeId peer_id, const std::vector<uint8_t>& skdata,
-    std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, bool& result)
+    std::vector<uint32_t>& txs_to_request, std::vector<uint256>& txs_to_announce, std::optional<bool>& result)
 {
     return m_impl->HandleSketch(peer_id, skdata, txs_to_request, txs_to_announce, result);
 }
