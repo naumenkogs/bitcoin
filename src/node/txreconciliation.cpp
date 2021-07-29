@@ -228,6 +228,15 @@ public:
     std::map<uint32_t, Wtxid> m_snapshot_short_id_mapping;
 
     /**
+     * A peer could announce a transaction to us during reconciliation and after we snapshoted
+     * the initial set. We can't remove this new transaction from the snapshot, because
+     * then we won't be able to compute a valid extension (for the sketch already transmitted).
+     * Instead, we just remember those transaction, and not announce them when we announce
+     * stuff from the snapshot.
+     */
+    std::set<uint256> m_announced_during_extension;
+
+    /**
      * In a reconciliation round initiated by us, if we asked for an extension, we want to store
      * the sketch computed/transmitted in the initial step, so that we can use it when
      * sketch extension arrives.
@@ -331,6 +340,25 @@ public:
         return std::vector<uint256>(m_local_set.begin(), m_local_set.end());
     }
 
+
+    /**
+     * Once we are fully done with the reconciliation we initiated, prepare the state for the
+     * following reconciliations we initiate.
+     */
+    void FinalizeInitByUs(bool clear_local_set)
+    {
+        assert(m_we_initiate);
+        if (clear_local_set) {
+            m_short_id_mapping.clear();
+            m_local_set.clear();
+        }
+        m_local_set_snapshot.clear();
+        m_announced_during_extension.clear();
+        // This is currently belt-and-suspenders, as the code should work even without these calls.
+        m_capacity_snapshot = 0;
+        m_remote_sketch_snapshot.clear();
+        m_snapshot_short_id_mapping.clear();
+    }
 
     /**
      * When during reconciliation we find a set difference successfully (by combining sketches),
@@ -469,7 +497,7 @@ private:
             txs_to_announce = recon_state.GetAllTransactions();
 
             // Update local reconciliation state for the peer.
-            recon_state.m_local_set.clear();
+            recon_state.FinalizeInitByUs(true);
             recon_state.m_phase = Phase::NONE;
 
             result = false;
@@ -493,7 +521,7 @@ private:
             recon_state.GetRelevantIDsFromShortIDs(differences, txs_to_request, txs_to_announce);
 
             // Update local reconciliation state for the peer.
-            recon_state.m_local_set.clear();
+            recon_state.FinalizeInitByUs(true);
             recon_state.m_phase = Phase::NONE;
 
             result = true;
@@ -677,6 +705,10 @@ public:
             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, "Couldn't remove %s from the reconciliation set for peer=%d. "
                                                                         "Transaction not found\n",
                           wtxid.ToString(), peer_id);
+        }
+
+        if (peer_state->m_local_set_snapshot.find(wtxid) != peer_state->m_local_set_snapshot.end()) {
+                peer_state->m_announced_during_extension.insert(wtxid);
         }
 
         return removed;
