@@ -22,10 +22,15 @@ static void ShouldFanoutTo(benchmark::Bench& bench)
     FastRandomContext rc{/*fDeterministic=*/true};
     CSipHasher hasher(0x0706050403020100ULL, 0x0F0E0D0C0B0A0908ULL);
 
+    std::vector<Wtxid> txs;
+    for (size_t i = 0; i < 1000; i++) {
+        txs.push_back(Wtxid::FromUint256(rc.rand256()));
+    }
+
     bench.run([&] {
-        auto wtxid = Wtxid::FromUint256(rc.rand256());
+        size_t rand_i = rand() % txs.size();
         for (NodeId peer = 0; peer < num_peers; ++peer) {
-            tracker.ShouldFanoutTo(wtxid, CSipHasher(hasher), peer,/*inbounds_nonrcncl_tx_relay=*/0, /*outbounds_nonrcncl_tx_relay=*/0);
+            tracker.ShouldFanoutTo(txs[rand_i], CSipHasher(hasher), peer,/*inbounds_nonrcncl_tx_relay=*/0, /*outbounds_nonrcncl_tx_relay=*/0);
         }
     });
 }

@@ -90,6 +90,20 @@ private:
      */
     std::unordered_map<NodeId, std::variant<uint64_t, TxReconciliationState>> m_states GUARDED_BY(m_txreconciliation_mutex);
 
+    /*
+     * A least-recently-added cache tracking which peers we should fanout a transaction to.
+     *
+     * Since the time between cache accesses is on the order of seconds, returning an outdated
+     * set of peers is not a concern (especially since we fanout to outbound peers, which should
+     * be hard to manipulate).
+     *
+     * No need to use LRU (bump transaction order upon access) because in most cases
+     * transactions are processed almost-sequentially.
+     */
+    std::deque<Wtxid> tx_fanout_targes_cache_order;
+    // std::unordered_map<uint256, std::set<NodeId>, SaltedTxidHasher> tx_fanout_targets_cache_data GUARDED_BY(m_txreconciliation_mutex);
+    std::map<Wtxid, std::set<NodeId>> tx_fanout_targets_cache_data GUARDED_BY(m_txreconciliation_mutex);
+
 public:
     explicit Impl(uint32_t recon_version) : m_recon_version(recon_version) {}
 
@@ -242,7 +256,7 @@ public:
 
     bool ShouldFanoutTo(const Wtxid& wtxid, CSipHasher deterministic_randomizer, NodeId peer_id,
                         size_t inbounds_nonrcncl_tx_relay, size_t outbounds_nonrcncl_tx_relay)
-        const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
     {
         AssertLockNotHeld(m_txreconciliation_mutex);
         LOCK(m_txreconciliation_mutex);
@@ -279,12 +293,25 @@ public:
             return false;
         }
 
-        // We use the pre-determined randomness to give a consistent result per transaction,
-        // thus making sure that no transaction gets "unlucky" if every per-peer roll fails.
-        deterministic_randomizer.Write(wtxid.ToUint256());
+        auto fanout_candidates = tx_fanout_targets_cache_data.find(wtxid);
+        if (fanout_candidates == tx_fanout_targets_cache_data.end()) {
+            // We use the pre-determined randomness to give a consistent result per transaction,
+            // thus making sure that no transaction gets "unlucky" if every per-peer roll fails.
+            deterministic_randomizer.Write(wtxid.ToUint256());
 
-        auto fanout_candidates = GetFanoutTargets(deterministic_randomizer, recon_state.m_we_initiate, destinations);
-        return fanout_candidates.find(peer_id) != fanout_candidates.end();
+            auto new_fanout_candidates = GetFanoutTargets(deterministic_randomizer, recon_state.m_we_initiate, destinations);
+            tx_fanout_targets_cache_data.emplace(wtxid, new_fanout_candidates);
+            // Replace the oldest cache item with this new one.
+            if (tx_fanout_targes_cache_order.size () == 3000) {
+                auto expired_tx = tx_fanout_targes_cache_order.front();
+                tx_fanout_targets_cache_data.erase(expired_tx);
+                tx_fanout_targes_cache_order.pop_front();
+                tx_fanout_targes_cache_order.push_back(wtxid);
+            }
+            return new_fanout_candidates.find(peer_id) != new_fanout_candidates.end();
+        } else {
+            return fanout_candidates->second.find(peer_id) != fanout_candidates->second.end();
+        }
     }
 };
 
@@ -324,7 +351,7 @@ bool TxReconciliationTracker::IsPeerRegistered(NodeId peer_id) const
 }
 
 bool TxReconciliationTracker::ShouldFanoutTo(const Wtxid& wtxid, CSipHasher deterministic_randomizer, NodeId peer_id,
-                                             size_t inbounds_nonrcncl_tx_relay, size_t outbounds_nonrcncl_tx_relay) const
+                                             size_t inbounds_nonrcncl_tx_relay, size_t outbounds_nonrcncl_tx_relay)
 {
     return m_impl->ShouldFanoutTo(wtxid, deterministic_randomizer, peer_id,
                                   inbounds_nonrcncl_tx_relay, outbounds_nonrcncl_tx_relay);
