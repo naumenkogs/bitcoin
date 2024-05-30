@@ -79,7 +79,7 @@ private:
     const std::unique_ptr<Impl> m_impl;
 
 public:
-    explicit TxReconciliationTracker(uint32_t recon_version);
+    explicit TxReconciliationTracker(uint32_t recon_version, CSipHasher hasher);
     ~TxReconciliationTracker();
 
     /**
@@ -123,6 +123,11 @@ public:
      */
     bool IsPeerRegistered(NodeId peer_id) const;
 
+    /**
+     * Returns whether the peer is chosen as a low-fanout destination for a given tx.
+     */
+    bool ShouldFanoutTo(const Wtxid& wtxid, NodeId peer_id,
+                        size_t inbounds_fanout_tx_relay, size_t outbounds_fanout_tx_relay);
 
     /**
      * Returns a collections of node ids sorted by how many instances of the provided transaction ids
