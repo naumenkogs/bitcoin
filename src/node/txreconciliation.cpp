@@ -150,6 +150,13 @@ private:
      */
     size_t m_inbounds_count GUARDED_BY(m_txreconciliation_mutex){0};
 
+    /**
+     * Maintains a queue of reconciliations we should initiate. To achieve higher bandwidth
+     * conservation and avoid overflows, we should reconcile in the same order, because then it’s
+     * easier to estimate set difference size.
+     */
+    std::deque<NodeId> m_queue GUARDED_BY(m_txreconciliation_mutex);
+
     // Used for randomly choosing fanout targets.
     CSipHasher m_deterministic_randomizer;
 
@@ -214,6 +221,7 @@ public:
         if (is_peer_inbound && m_inbounds_count < std::numeric_limits<size_t>::max()) {
             ++m_inbounds_count;
         }
+        if (!is_peer_inbound) m_queue.push_back(peer_id);
         return ReconciliationRegisterResult::SUCCESS;
     }
 
@@ -336,9 +344,13 @@ public:
         if (peer == m_states.end()) return;
 
         const auto registered = std::get_if<TxReconciliationState>(&peer->second);
-        if (registered && !registered->m_we_initiate) {
-            Assert(m_inbounds_count > 0);
-            --m_inbounds_count;
+        if (registered) {
+            if (registered->m_we_initiate) {
+                m_queue.erase(std::remove(m_queue.begin(), m_queue.end(), peer_id), m_queue.end());
+            } else {
+                Assert(m_inbounds_count > 0);
+                --m_inbounds_count;
+            }
         }
 
         m_states.erase(peer);
