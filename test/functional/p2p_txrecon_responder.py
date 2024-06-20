@@ -136,9 +136,12 @@ class ReconciliationResponderTest(ReconciliationTest):
     #
 
     def reconciliation_responder_flow(self, n_mininode, n_node, initial_result, result):
+        # Get the set of coins here so we don't end up re-using any
+        utxos = [u for u in self.nodes[0].listunspent(1) if u['confirmations'] > 0]
+
         # Generate transactions and let them trigger announcement (low-fanout or adding
         # to recon set).
-        _, node_txs, _ = self.generate_txs(n_mininode, n_node, 0)
+        _, node_txs, _ = self.generate_txs(n_mininode, n_node, 0, utxos)
         self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 10)
 
         # We will announce extra transactions which should not be lost during the
@@ -173,7 +176,7 @@ class ReconciliationResponderTest(ReconciliationTest):
 
         self.check_sketch(n_mininode, node_txs, False)
 
-        more_node_txs.extend(self.generate_txs(0, 8, 0)[1])
+        more_node_txs.extend(self.generate_txs(0, 8, 0, utxos)[1])
         self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 10)
 
         if not initial_result and n_mininode != 0 and n_node != 0:
@@ -183,7 +186,7 @@ class ReconciliationResponderTest(ReconciliationTest):
             self.expect_sketch(n_mininode)
             self.check_sketch(n_mininode, node_txs, True)
 
-        more_node_txs.extend(self.generate_txs(0, 8, 0)[1])
+        more_node_txs.extend(self.generate_txs(0, 8, 0, utxos)[1])
         self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 10)
 
         expected_txs_announced = []

@@ -162,26 +162,10 @@ class ReconciliationTest(BitcoinTestFramework):
         k1 = int.from_bytes(h[8:16], "little")
         return k0, k1
 
-    def generate_txs(self, n_mininode_unique, n_node_unique, n_shared):
-        mininode_unique = []
-        node_unique = []
-        shared = []
-
-        for i in range(n_mininode_unique):
-            utxos = [u for u in self.nodes[0].listunspent(1) if u['confirmations'] > 0]
-            tx = generate_transaction(self.nodes[0], utxos[i]['txid'])
-            mininode_unique.append(tx)
-
-        for i in range(n_mininode_unique, n_mininode_unique + n_node_unique):
-            utxos = [u for u in self.nodes[0].listunspent(1) if u['confirmations'] > 0]
-            tx = generate_transaction(self.nodes[0], utxos[i]['txid'])
-            node_unique.append(tx)
-
-        for i in range(n_mininode_unique + n_node_unique,
-                       n_mininode_unique + n_node_unique + n_shared):
-            utxos = [u for u in self.nodes[0].listunspent(1) if u['confirmations'] > 0]
-            tx = generate_transaction(self.nodes[0], utxos[i]['txid'])
-            shared.append(tx)
+    def generate_txs(self, n_mininode_unique, n_node_unique, n_shared, utxos):
+        mininode_unique = [generate_transaction(self.nodes[0], utxos.pop()['txid']) for _ in range(0, n_mininode_unique)]
+        node_unique = [generate_transaction(self.nodes[0], utxos.pop()['txid']) for _ in range(0, n_node_unique)]
+        shared = [generate_transaction(self.nodes[0], utxos.pop()['txid']) for _ in range(0, n_shared)]
 
         tx_submitter = self.nodes[0].add_p2p_connection(P2PDataStore())
         tx_submitter.wait_for_verack()

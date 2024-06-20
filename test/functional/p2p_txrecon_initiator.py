@@ -145,10 +145,11 @@ class ReconciliationInitiatorTest(ReconciliationTest):
     #
 
     def reconciliation_initiator_flow(self, n_node, n_mininode, n_shared, terminate_after_initial, expected_success):
+        # Get the set of coins here so we don't end up re-using any
+        utxos = [u for u in self.nodes[0].listunspent(1) if u['confirmations'] > 0]
 
         # Generate and submit transactions.
-        mininode_unique_txs, node_unique_txs, shared_txs = self.generate_txs(
-            n_mininode, n_node, n_shared)
+        mininode_unique_txs, node_unique_txs, shared_txs = self.generate_txs(n_mininode, n_node, n_shared, utxos)
         mininode_txs = mininode_unique_txs + shared_txs
         node_txs = node_unique_txs + shared_txs
         time.sleep(0.1)
@@ -181,7 +182,7 @@ class ReconciliationInitiatorTest(ReconciliationTest):
                                  extension=False, capacity=capacity)
 
             # Add extra transactions, and let them trigger adding to recon sets or low-fanout.
-            more_node_txs.extend(self.generate_txs(0, 10, 0)[1])
+            more_node_txs.extend(self.generate_txs(0, 10, 0, utxos)[1])
             time.sleep(0.1)
             self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 3)
 
@@ -217,7 +218,7 @@ class ReconciliationInitiatorTest(ReconciliationTest):
                                  extension=False, capacity=capacity)
 
             # Add extra transactions, and let them trigger adding to recon sets or low-fanout.
-            more_node_txs.extend(self.generate_txs(0, 4, 0)[1])
+            more_node_txs.extend(self.generate_txs(0, 4, 0, utxos)[1])
             time.sleep(0.1)
             self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 3)
 
@@ -226,7 +227,7 @@ class ReconciliationInitiatorTest(ReconciliationTest):
             self.handle_extension_request()
 
             # Add extra transactions, and let them trigger adding to recon sets or low-fanout.
-            more_node_txs.extend(self.generate_txs(0, 4, 0)[1])
+            more_node_txs.extend(self.generate_txs(0, 4, 0, utxos)[1])
             time.sleep(0.1)
             self.proceed_in_time(INVENTORY_BROADCAST_INTERVAL + 3)
 
