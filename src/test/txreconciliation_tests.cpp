@@ -323,8 +323,12 @@ BOOST_AUTO_TEST_CASE(ShouldFanoutToTest)
 
     // Don't select a fanout target if it was already fanouted sufficiently.
     for (int i = 0; i < 100; ++i) {
+        // fanouted to one peer.
         BOOST_CHECK(!tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
                                             /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/1));
+        // fanouted to 100 peers.
+        BOOST_CHECK(!tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
+                                            /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/100));
     }
 
     tracker.ForgetPeer(peer_id0);
