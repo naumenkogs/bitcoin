@@ -454,19 +454,13 @@ public:
         // whether the given peer falls into this list.
         double n;
         if (peer_state->m_we_initiate) {
-            n = OUTBOUND_FANOUT_DESTINATIONS - outbounds_fanout_tx_relay;
+            n = (double)OUTBOUND_FANOUT_DESTINATIONS - outbounds_fanout_tx_relay;
         } else {
-            // Since we use the fraction for inbound peers, we first need to compute the total
-            // number of inbound targets.
             const double inbound_targets = (inbounds_fanout_tx_relay + m_inbounds_count) * INBOUND_FANOUT_DESTINATIONS_FRACTION;
             n = inbound_targets - inbounds_fanout_tx_relay;
         }
 
-        // Pure optimization to avoid going through the peers when the odds of picking one are
-        // too low.
-        if (n < 0.001) {
-            return false;
-        }
+        if (n < 0) return false;
 
         return IsFanoutTarget(wtxid, peer_id, peer_state->m_we_initiate, n);
     }
