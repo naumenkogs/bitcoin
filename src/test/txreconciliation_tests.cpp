@@ -286,43 +286,38 @@ BOOST_AUTO_TEST_CASE(ShouldFanoutToTest)
     TxReconciliationTracker tracker(TXRECONCILIATION_VERSION, hasher);
     NodeId peer_id0 = 0;
     FastRandomContext frc{/*fDeterministic=*/true};
+    std::vector<NodeId> fanout_targets;
 
     // If peer is not registered for reconciliation, it should be always chosen for flooding.
     BOOST_REQUIRE(!tracker.IsPeerRegistered(peer_id0));
-    for (int i = 0; i < 100; ++i) {
-        BOOST_CHECK(tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                           /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0));
-    }
+    BOOST_CHECK(tracker.ShouldFanoutTo(peer_id0, fanout_targets));
+
 
     tracker.PreRegisterPeer(peer_id0);
     BOOST_REQUIRE(!tracker.IsPeerRegistered(peer_id0));
     // Same after pre-registering.
-    for (int i = 0; i < 100; ++i) {
-        BOOST_CHECK(tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                           /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0));
-    }
+    BOOST_CHECK(tracker.ShouldFanoutTo(peer_id0, fanout_targets));
 
     // Once the peer is registered, it should be selected for flooding of some transactions.
     // Since there is only one reconciling peer, it will be selected for all transactions.
     BOOST_REQUIRE_EQUAL(tracker.RegisterPeer(peer_id0, /*is_peer_inbound=*/false, 1, 1), ReconciliationRegisterResult::SUCCESS);
     for (int i = 0; i < 100; ++i) {
-        BOOST_CHECK(tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                           /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0));
+        fanout_targets = tracker.GetFanoutTargets(Wtxid::FromUint256(frc.rand256()), /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
+        BOOST_CHECK(tracker.ShouldFanoutTo(peer_id0, fanout_targets));
     }
 
-    // Don't select a fanout target if it was already fanouted sufficiently.
+    // Don't select a fanout target if we already have enough targets
     for (int i = 0; i < 100; ++i) {
-        BOOST_CHECK(!tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                            /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/1));
-        BOOST_CHECK(!tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                            /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/100));
+        fanout_targets = tracker.GetFanoutTargets(Wtxid::FromUint256(frc.rand256()), /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/2);
+        BOOST_CHECK(!tracker.ShouldFanoutTo(peer_id0, fanout_targets));
+        fanout_targets = tracker.GetFanoutTargets(Wtxid::FromUint256(frc.rand256()), /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/100);
+        BOOST_CHECK(!tracker.ShouldFanoutTo(peer_id0, fanout_targets));
     }
 
     tracker.ForgetPeer(peer_id0);
     // A forgotten (reconciliation-wise) peer should be always selected for fanout again.
     for (int i = 0; i < 100; ++i) {
-        BOOST_CHECK(tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), peer_id0,
-                                           /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0));
+        BOOST_CHECK(tracker.ShouldFanoutTo(peer_id0, fanout_targets));
     }
 
     // Now for inbound connections.
@@ -343,21 +338,22 @@ BOOST_AUTO_TEST_CASE(ShouldFanoutToTest)
     size_t total_fanouted1 = 0;
     size_t total_fanouted2 = 0;
     auto wtxid = Wtxid::FromUint256(uint256(1)); // determinism is required.
+    std::vector<NodeId> fanout_targets_t2;
+    fanout_targets = tracker.GetFanoutTargets(Wtxid::FromUint256(wtxid), /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
+    fanout_targets_t2 = tracker2.GetFanoutTargets(Wtxid::FromUint256(wtxid), /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
     for (int i = 1; i < inbound_peers; ++i) {
-        total_fanouted1 += tracker.ShouldFanoutTo(wtxid, i,
-                                                  /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
-        total_fanouted2 += tracker2.ShouldFanoutTo(wtxid, i,
-                                                   /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
+        total_fanouted1 += tracker.ShouldFanoutTo(i, fanout_targets);
+        total_fanouted2 += tracker2.ShouldFanoutTo(i, fanout_targets_t2);
     }
     BOOST_CHECK_EQUAL(total_fanouted1, 3);
     BOOST_CHECK_EQUAL(total_fanouted2, 4);
 
     // Don't relay if there is sufficient non-reconciling peers
+    fanout_targets = tracker.GetFanoutTargets(Wtxid::FromUint256(frc.rand256()), /*inbounds_fanout_tx_relay=*/4, /*outbounds_fanout_tx_relay=*/0);
     for (int j = 0; j < 100; ++j) {
         size_t total_fanouted = 0;
         for (int i = 1; i < inbound_peers; ++i) {
-            total_fanouted += tracker.ShouldFanoutTo(Wtxid::FromUint256(frc.rand256()), i,
-                                                     /*inbounds_fanout_tx_relay=*/4, /*outbounds_fanout_tx_relay=*/0);
+            total_fanouted += tracker.ShouldFanoutTo(i, fanout_targets);
         }
         BOOST_CHECK_EQUAL(total_fanouted, 0);
     }

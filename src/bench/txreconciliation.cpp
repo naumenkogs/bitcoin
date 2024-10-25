@@ -29,9 +29,11 @@ static void ShouldFanoutTo(benchmark::Bench& bench)
         txs.push_back(Wtxid::FromUint256(rc.rand256()));
     }
 
+    std::vector<NodeId> fanout_targets;
     bench.run([&] {
         for (NodeId peer = 0; peer < num_peers; ++peer) {
-            tracker.ShouldFanoutTo(txs[rand() % txs.size()], peer, /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
+            fanout_targets = tracker.GetFanoutTargets(txs[rand() % txs.size()], /*inbounds_fanout_tx_relay=*/0, /*outbounds_fanout_tx_relay=*/0);
+            tracker.ShouldFanoutTo(peer, fanout_targets);
         }
     });
 }

@@ -2143,10 +2143,12 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
     size_t inbounds_fanout_tx_relay{0}, outbounds_fanout_tx_relay{0};
     std::vector<Wtxid> parents;
     std::vector<NodeId> fanout_with_ancestors;
+    std::vector<NodeId> fanout_targets;
     const bool can_reconcile = !force_relay && m_txreconciliation;
     {
         if (can_reconcile) {
             std::tie(inbounds_fanout_tx_relay, outbounds_fanout_tx_relay) = GetFanoutPeersCount();
+            fanout_targets = m_txreconciliation->GetFanoutTargets(Wtxid::FromUint256(wtxid), inbounds_fanout_tx_relay, outbounds_fanout_tx_relay);
             LOCK(m_mempool.cs);
             if (auto txiter = m_mempool.GetIter(wtxid)) {
                 const auto parents_refs = (*txiter)->GetMemPoolParents();
@@ -2188,7 +2190,7 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
                 }
             } else {
                 // If the peer is registered for set reconciliation, maybe pick it as fanout
-                fanout = m_txreconciliation->ShouldFanoutTo(Wtxid::FromUint256(wtxid), peer_id, inbounds_fanout_tx_relay, outbounds_fanout_tx_relay);
+                fanout = m_txreconciliation->ShouldFanoutTo(peer_id, fanout_targets);
             }
         }
 
