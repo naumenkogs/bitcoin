@@ -217,6 +217,37 @@ public:
         return (recon_state != m_states.end() &&
                 std::holds_alternative<TxReconciliationState>(recon_state->second));
     }
+
+    std::vector<NodeId> SortPeersByFewestParents(std::vector<Wtxid> parents) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)
+    {
+        AssertLockNotHeld(m_txreconciliation_mutex);
+        LOCK(m_txreconciliation_mutex);
+
+        std::vector<std::pair<uint16_t, NodeId>> parents_by_peer{};
+        for (const auto &[peer_id, _]: m_states) {
+            if (GetRegisteredPeerState(peer_id)) {
+                parents_by_peer.emplace_back(0, peer_id);
+            }
+        }
+
+        for (auto &[parent_count, peer_id]: parents_by_peer) {
+            const auto state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);
+            for (const auto& wtxid: parents) {
+                if (auto found = state.m_local_set.find(wtxid); found != state.m_local_set.end()) {
+                    ++parent_count;
+                }
+            }
+        }
+
+        std::sort(parents_by_peer.begin(), parents_by_peer.end());
+        std::vector<NodeId> sorted_peers;
+        sorted_peers.reserve(parents_by_peer.size());
+        for (const auto &[_, node_id]: parents_by_peer) {
+            sorted_peers.emplace_back(node_id);
+        }
+
+        return sorted_peers;
+    }
 };
 
 AddToSetResult::AddToSetResult(bool succeeded, std::optional<Wtxid> conflict)
@@ -273,4 +304,9 @@ void TxReconciliationTracker::ForgetPeer(NodeId peer_id)
 bool TxReconciliationTracker::IsPeerRegistered(NodeId peer_id) const
 {
     return m_impl->IsPeerRegistered(peer_id);
+}
+
+std::vector<NodeId> TxReconciliationTracker::SortPeersByFewestParents(std::vector<Wtxid> parents)
+{
+    return m_impl->SortPeersByFewestParents(parents);
 }
