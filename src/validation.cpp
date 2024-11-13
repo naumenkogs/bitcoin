@@ -1801,6 +1801,16 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
         }
     }
 
+    // Handle one-tx package before LimitMempoolSize because it was already
+    // called in AcceptSingleTransaction.
+    if (package.size() == 1) {
+        Assume(results_final.size() == 1);
+        const auto wtxid = package[0]->GetWitnessHash();
+        const auto it{results_final.find(wtxid)};
+        Assume(it != results_final.end());
+        return PackageMempoolAcceptResult(wtxid, it->second);
+    }
+
     auto multi_submission_result = quit_early || txns_package_eval.empty() ? PackageMempoolAcceptResult(package_state_quit_early, {}) :
         AcceptSubPackage(txns_package_eval, args);
     PackageValidationState& package_state_final = multi_submission_result.m_state;
@@ -1809,12 +1819,12 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
     // Package transactions that were submitted to mempool or already in mempool may be evicted.
     LimitMempoolSize(m_pool, m_active_chainstate.CoinsTip());
 
+    Assume(package.size() > 1);
     for (const auto& tx : package) {
         const auto& wtxid = tx->GetWitnessHash();
         if (multi_submission_result.m_tx_results.count(wtxid) > 0) {
             // We shouldn't have re-submitted if the tx result was already in results_final.
             Assume(results_final.count(wtxid) == 0);
-            Assume(package.size() > 1);
             // If it was submitted, check to see if the tx is still in the mempool. It could have
             // been evicted due to LimitMempoolSize() above.
             const auto& txresult = multi_submission_result.m_tx_results.at(wtxid);
@@ -1833,20 +1843,17 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
             // Could also be a failed (any kind) single-tx package. Do nothing, because if it was
             // evicted, we would know it from AcceptSingleTransaction().
             Assume(individual_results_nonfinal.count(wtxid) == 0);
-            if (package.size() > 1) {
-                Assume(it->second.m_result_type != MempoolAcceptResult::ResultType::INVALID);
-                // Query by txid to include the same-txid-different-witness ones.
-                if (!m_pool.exists(GenTxid::Txid(tx->GetHash()))) {
-                    package_state_final.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
-                    TxValidationState mempool_full_state;
-                    mempool_full_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "mempool full");
-                    // Replace the previous result.
-                    results_final.erase(wtxid);
-                    results_final.emplace(wtxid, MempoolAcceptResult::Failure(mempool_full_state));
-                }
+            Assume(it->second.m_result_type != MempoolAcceptResult::ResultType::INVALID);
+            // Query by txid to include the same-txid-different-witness ones.
+            if (!m_pool.exists(GenTxid::Txid(tx->GetHash()))) {
+                package_state_final.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+                TxValidationState mempool_full_state;
+                mempool_full_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "mempool full");
+                // Replace the previous result.
+                results_final.erase(wtxid);
+                results_final.emplace(wtxid, MempoolAcceptResult::Failure(mempool_full_state));
             }
         } else if (const auto it{individual_results_nonfinal.find(wtxid)}; it != individual_results_nonfinal.end()) {
-            Assume(package.size() > 1);
             Assume(it->second.m_result_type == MempoolAcceptResult::ResultType::INVALID);
             // Interesting result from previous processing.
             results_final.emplace(wtxid, it->second);
