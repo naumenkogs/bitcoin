@@ -463,7 +463,7 @@ public:
          * Finalize(). Instead, limits should be enforced at the end to ensure the package is not
          * partially submitted.
          */
-        const bool m_package_submission;
+        bool m_package_submission;
         /** When true, use package feerates instead of individual transaction feerates for fee-based
          * policies such as mempool min fee and min relay fee.
          */
@@ -1770,6 +1770,9 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
         } else {
             // Transaction does not already exist in the mempool.
             // Try submitting the transaction on its own.
+            if (package.size() == 1) {
+                args.m_package_submission = false;
+            }
             const auto single_package_res = AcceptSubPackage({tx}, args);
             const auto& single_res = single_package_res.m_tx_results.at(wtxid);
             if (single_res.m_result_type == MempoolAcceptResult::ResultType::VALID) {
