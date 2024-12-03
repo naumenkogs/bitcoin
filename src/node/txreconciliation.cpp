@@ -57,7 +57,7 @@ static_assert(RECON_FALSE_POSITIVE_COEF <= 256,
  * A floating point coefficient q for estimating reconciliation set difference, and
  * the value used to convert it to integer for transmission purposes, as specified in BIP-330.
  */
-constexpr double Q = 0.25;
+constexpr double Q = 0.45;
 constexpr uint16_t Q_PRECISION{(2 << 14) - 1};
 /**
  * Interval between initiating reconciliations with peers.
@@ -191,7 +191,7 @@ public:
     */
     bool ContainsTx(const Wtxid& wtxid, bool include_delayed)
     {
-        bool found = m_local_set.find(wtxid) != m_local_set.end();
+        bool found = m_local_set.find(wtxid) != m_local_set.end() || m_local_set_snapshot.find(wtxid) != m_local_set_snapshot.end();
         if (include_delayed) {
             found |= m_delayed_local_set.find(wtxid) != m_delayed_local_set.end();
         }
@@ -1137,6 +1137,15 @@ public:
         auto peer_state = GetRegisteredPeerState(peer_id);
         if (!peer_state) return true;
 
+        // TODO
+        // The original code doesn't work in my test setup (a single inbound erlay node always gets all fanout).
+        // This is a temporary ugly fix.
+        // Furthermore, only do this for inbounds...
+        if (!peer_state->m_we_initiate) {
+            // 10% INBOUND_FANOUT_DESTINATIONS_FRACTION
+            return (rand() % 10) == 0;
+        }
+
         return std::find(fanout_targets.begin(), fanout_targets.end(), peer_id) != fanout_targets.end();
     }
 
@@ -1145,29 +1154,20 @@ public:
         AssertLockNotHeld(m_txreconciliation_mutex);
         LOCK(m_txreconciliation_mutex);
 
-        std::vector<std::pair<uint16_t, NodeId>> parents_by_peer{};
-        for (const auto &[peer_id, _]: m_states) {
-            if (GetRegisteredPeerState(peer_id)) {
-                parents_by_peer.emplace_back(0, peer_id);
+        std::multimap<uint16_t, NodeId> parents_by_peer;
+        for (const auto &[peer_id, state_or_salt]: m_states) {
+            if (const auto state = std::get_if<TxReconciliationState>(&state_or_salt)) {
+                const size_t parent_count = std::count_if(parents.begin(), parents.end(),
+                       [=](const auto& wtxid){return state->m_local_set.find(wtxid) != state->m_local_set.end();});
+                parents_by_peer.insert(std::make_pair(parent_count, peer_id));
             }
         }
 
-        for (auto &[parent_count, peer_id]: parents_by_peer) {
-            auto state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);
-            for (const auto& wtxid: parents) {
-                if (state.ContainsTx(wtxid, /*include_delayed=*/true)) {
-                    ++parent_count;
-                }
-            }
-        }
-
-        std::sort(parents_by_peer.begin(), parents_by_peer.end());
         std::vector<NodeId> sorted_peers;
         sorted_peers.reserve(parents_by_peer.size());
-        for (const auto &[_, node_id]: parents_by_peer) {
-            sorted_peers.emplace_back(node_id);
+        for (const auto &[_, peer_id]: parents_by_peer) {
+            sorted_peers.emplace_back(peer_id);
         }
-
         return sorted_peers;
     }
 };

@@ -325,6 +325,7 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
     NetMsgType::REQTXRCNCL,
+    NetMsgType::SKETCH,
 })};
 
 /** nServices flags */

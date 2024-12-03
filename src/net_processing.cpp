@@ -785,7 +785,8 @@ private:
 
     uint32_t GetFetchFlags(const Peer& peer) const;
 
-    std::atomic<std::chrono::microseconds> m_next_inv_to_inbounds{0us};
+    std::atomic<std::chrono::microseconds> m_next_inv_to_inbounds_legacy{0us};
+    std::atomic<std::chrono::microseconds> m_next_inv_to_inbounds_erlay{0us};
 
     /** Number of nodes with fSyncStarted. */
     int nSyncStarted GUARDED_BY(cs_main) = 0;
@@ -820,7 +821,7 @@ private:
      * accurately determine when we received the transaction (and potentially
      * determine the transaction's origin). */
     std::chrono::microseconds NextInvToInbounds(std::chrono::microseconds now,
-                                                std::chrono::seconds average_interval) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+                                                bool peer_reconciles) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
 
     // All of the following cache a recent block, and are protected by m_most_recent_block_mutex
@@ -1119,15 +1120,25 @@ static bool CanServeWitnesses(const Peer& peer)
 }
 
 std::chrono::microseconds PeerManagerImpl::NextInvToInbounds(std::chrono::microseconds now,
-                                                             std::chrono::seconds average_interval)
+                                                             bool peer_reconciles)
 {
-    if (m_next_inv_to_inbounds.load() < now) {
-        // If this function were called from multiple threads simultaneously
-        // it would possible that both update the next send variable, and return a different result to their caller.
-        // This is not possible in practice as only the net processing thread invokes this function.
-        m_next_inv_to_inbounds = now + m_rng.rand_exp_duration(average_interval);
+    if (peer_reconciles) {
+        if (m_next_inv_to_inbounds_erlay.load() < now) {
+            // If this function were called from multiple threads simultaneously
+            // it would possible that both update the next send variable, and return a different result to their caller.
+            // This is not possible in practice as only the net processing thread invokes this function.
+            m_next_inv_to_inbounds_erlay = now + m_rng.rand_exp_duration(2s);
+        }
+        return m_next_inv_to_inbounds_erlay;
+    } else {
+        if (m_next_inv_to_inbounds_legacy.load() < now) {
+            // If this function were called from multiple threads simultaneously
+            // it would possible that both update the next send variable, and return a different result to their caller.
+            // This is not possible in practice as only the net processing thread invokes this function.
+            m_next_inv_to_inbounds_legacy = now + m_rng.rand_exp_duration(5s);
+        }
+        return m_next_inv_to_inbounds_legacy;
     }
-    return m_next_inv_to_inbounds;
 }
 
 bool PeerManagerImpl::IsBlockRequested(const uint256& hash)
@@ -2179,6 +2190,10 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
         // in the announcement.
         if (tx_relay->m_next_inv_send_time == 0s) continue;
 
+        if (tx_relay->m_tx_inventory_known_filter.contains(peer->m_wtxid_relay ? wtxid : txid)) {
+            continue;
+        }
+
         bool fanout = true;
         if (can_reconcile && m_txreconciliation->IsPeerRegistered(peer_id)) {
             // If this transaction has parents in the mempool and the peer is within the peers with less ancestors
@@ -2226,6 +2241,8 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
                         }
                     }
                 }
+            } else {
+                tx_relay->m_tx_inventory_known_filter.insert(wtxid);
             }
         }
 
@@ -5880,10 +5897,15 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);
                 if (tx_relay->m_next_inv_send_time < current_time) {
                     fSendTrickle = true;
+                    bool peer_reconciles = m_txreconciliation && m_txreconciliation->IsPeerRegistered(pto->GetId());
                     if (pto->IsInboundConn()) {
-                        tx_relay->m_next_inv_send_time = NextInvToInbounds(current_time, INBOUND_INVENTORY_BROADCAST_INTERVAL);
+                        // TODO: it is kinda certain that for reconciliations the times should be reduced (see the paper etc.).
+                        // However, it is unclear what to do with legacy nodes... I did simulate a mixture of nodes, but this particular
+                        // aspect I picked arbitrarily.
+                        // For now, do something convenient for the test purposes: have two intervals for each group of peers (legacy/erlay).
+                        tx_relay->m_next_inv_send_time = NextInvToInbounds(current_time, peer_reconciles);
                     } else {
-                        tx_relay->m_next_inv_send_time = current_time + m_rng.rand_exp_duration(OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
+                        tx_relay->m_next_inv_send_time = current_time + m_rng.rand_exp_duration(peer_reconciles ? 1s : OUTBOUND_INVENTORY_BROADCAST_INTERVAL);
                     }
                 }
 
