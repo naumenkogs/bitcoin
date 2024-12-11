@@ -756,6 +756,8 @@ public:
         LOCK(m_txreconciliation_mutex);
         auto peer_state = GetRegisteredPeerState(peer_id);
         if (!peer_state) return false;
+        // Don't do this while reconciliation is pending.
+        if (peer_state->m_phase != Phase::NONE) return false;
 
         peer_state->m_local_set.merge(peer_state->m_delayed_local_set);
         // There should be no duplicates, so m_delayed_local_set should be emptied

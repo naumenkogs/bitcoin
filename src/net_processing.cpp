@@ -276,6 +276,7 @@ struct Peer {
          *  permitted if the peer has NetPermissionFlags::Mempool or we advertise
          *  NODE_BLOOM. See BIP35. */
         bool m_send_mempool GUARDED_BY(m_tx_inventory_mutex){false};
+        bool m_ready_delayed{false};
         /** The next time after which we will send an `inv` message containing
          *  transaction announcements to this peer. */
         std::chrono::microseconds m_next_inv_send_time GUARDED_BY(m_tx_inventory_mutex){0};
@@ -5898,6 +5899,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 if (tx_relay->m_next_inv_send_time < current_time) {
                     fSendTrickle = true;
                     bool peer_reconciles = m_txreconciliation && m_txreconciliation->IsPeerRegistered(pto->GetId());
+                    if (peer_reconciles) tx_relay->m_ready_delayed = true;
                     if (pto->IsInboundConn()) {
                         // TODO: it is kinda certain that for reconciliations the times should be reduced (see the paper etc.).
                         // However, it is unclear what to do with legacy nodes... I did simulate a mixture of nodes, but this particular
@@ -5948,12 +5950,16 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     }
                 }
 
+                if (m_txreconciliation && tx_relay->m_ready_delayed) {
+                    Assume(m_txreconciliation->IsPeerRegistered(pto->GetId()));
+                    // Make transactions added to the reconciliation set during the last interval available
+                    if (m_txreconciliation->ReadyDelayedTransactions(pto->GetId())) {
+                        tx_relay->m_ready_delayed = false;
+                    }
+                }
+
                 // Determine transactions to relay
                 if (fSendTrickle) {
-                    if (m_txreconciliation && m_txreconciliation->IsPeerRegistered(pto->GetId())) {
-                        // Make transactions added to the reconciliation set during the last interval available
-                        m_txreconciliation->ReadyDelayedTransactions(pto->GetId());
-                    }
                     // Produce a vector with all candidates for sending
                     std::vector<uint256> vInvTx;
                     vInvTx.reserve(tx_relay->m_tx_inventory_to_send.size());
