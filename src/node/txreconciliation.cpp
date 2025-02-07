@@ -157,6 +157,7 @@ public:
      */
     bool ConsiderInitResponseAndTrack()
     {
+        return true;
         auto current_time = GetTime<std::chrono::seconds>();
         if (m_last_init_recon_respond <= current_time - RECON_RESPONSE_INTERVAL) {
             m_last_init_recon_respond = current_time;
@@ -264,7 +265,7 @@ public:
         const uint16_t set_size_diff = std::abs(uint16_t(local_set_size) - m_remote_set_size);
         const uint16_t min_size = std::min(uint16_t(local_set_size), m_remote_set_size);
         const uint16_t weighted_min_size = m_remote_q * min_size;
-        const uint32_t estimated_diff = 1 + weighted_min_size + set_size_diff;
+        const uint32_t estimated_diff = 1 + weighted_min_size + set_size_diff + 25;
         return minisketch_compute_capacity(RECON_FIELD_SIZE, estimated_diff, RECON_FALSE_POSITIVE_COEF);
     }
 
@@ -485,7 +486,7 @@ private:
                                                     });
 
         Assert(we_initiate_to_count != 0);
-        m_next_recon_request = now + (RECON_REQUEST_INTERVAL / we_initiate_to_count);
+        m_next_recon_request = now + 1s;//(RECON_REQUEST_INTERVAL / we_initiate_to_count);
     }
 
     bool HandleInitialSketch(TxReconciliationState& recon_state, const NodeId peer_id,
@@ -823,8 +824,10 @@ public:
             //
             // This doesn't prevent from a malicious peer gaming this by staying in this state
             // all the time somehow.
-            if (recon_state.m_phase == Phase::NONE) UpdateNextReconRequest(now);
-            return true;
+            if (recon_state.m_phase == Phase::NONE) {
+                UpdateNextReconRequest(now);
+                return true;
+            }
         }
 
         return false;
